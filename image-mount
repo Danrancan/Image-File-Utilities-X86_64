@@ -1,0 +1,124 @@
+#!/bin/bash
+# image-mount — x86_64 Ubuntu 24.04 / Debian 13
+# Mount a partition from a .img file (plain or LUKS) at a given mountpoint.
+# Prints the umount / losetup cleanup commands when done.
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+# Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
+
+errexit()
+{
+  echo ""; echo "$1"; echo ""
+  exit 1
+}
+
+usage()
+{
+  errexit "Usage: $0 [-p passphrase] imagefile mountpoint [EFI|Boot|Linux]
+  EFI   — mount EFI/vfat partition   (partition 1)
+  Boot  — mount /boot/ext4 partition (partition 2, 3-part images only)
+  Linux — mount root partition        (default)"
+}
+
+[ "$(id -u)" -ne 0 ] && errexit "$0 must be run as root user"
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+IMGFILE="" MNT="" PART="" PASSPHRASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--passphrase) PASSPHRASE="$2"; shift 2 ;;
+    -h|--help)       usage ;;
+    -*)              usage ;;
+    *)
+      if   [ -z "${IMGFILE}" ]; then IMGFILE="$1"
+      elif [ -z "${MNT}" ];     then MNT="$1"
+      elif [ -z "${PART}" ];    then PART="$1"
+      fi
+      shift ;;
+  esac
+done
+
+[ -z "${IMGFILE}" ] || [ -z "${MNT}" ] && usage
+[ ! -f "${IMGFILE}" ] && errexit "${IMGFILE} not found"
+[ ! -d "${MNT}" ]     && errexit "${MNT} is not a directory"
+
+LOOP="$(losetup -f --show -P "${IMGFILE}")"
+[ $? -ne 0 ] && errexit "Unable to create loop device"
+
+NUM_PARTS="$(lsblk -no NAME "${LOOP}" 2>/dev/null | grep -c 'p[0-9]')"
+
+PART="$(tr '[:upper:]' '[:lower:]' <<< "${PART:-linux}")"
+case "${PART}" in
+  efi)         PARTNUM=1 ;;
+  boot)
+    [ "${NUM_PARTS}" -lt 3 ] && { losetup -d "${LOOP}"; errexit "No separate /boot in this image"; }
+    PARTNUM=2 ;;
+  linux|root)  PARTNUM="${NUM_PARTS}" ;;
+  *)           losetup -d "${LOOP}"; usage ;;
+esac
+
+echo ""
+echo -n "Mount ${IMGFILE} partition ${PARTNUM} on ${MNT} (y/n)? "
+while read -r -n 1 -s a; do
+  if [[ "${a}" = [yYnN] ]]; then
+    echo "${a}"
+    if [[ "${a}" = [yY] ]]; then break; else losetup -d "${LOOP}"; errexit "Aborted"; fi
+  fi
+done
+echo ""
+
+FS_TYPE="$(blkid "${LOOP}p${PARTNUM}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+
+# LUKS root partition
+if [ "${FS_TYPE}" = "crypto_LUKS" ]; then
+  command -v cryptsetup &> /dev/null || apt-get install -y cryptsetup &> /dev/null
+  if [ -z "${PASSPHRASE}" ]; then
+    echo -n "Enter LUKS passphrase: "
+    read -rs PASSPHRASE; echo ""
+  fi
+  MAPPER="mount$(date +%s)"
+  echo -n "${PASSPHRASE}" | cryptsetup luksOpen "${LOOP}p${PARTNUM}" "${MAPPER}" --key-file=-
+  [ $? -ne 0 ] && { losetup -d "${LOOP}"; errexit "Failed to open LUKS container"; }
+
+  LVM_TYPE="$(blkid "/dev/mapper/${MAPPER}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+  if [ "${LVM_TYPE}" = "LVM2_member" ]; then
+    command -v vgchange &> /dev/null || apt-get install -y lvm2 &> /dev/null
+    VG="$(pvs --noheadings -o vg_name "/dev/mapper/${MAPPER}" 2>/dev/null | tr -d ' ')"
+    vgchange -ay "${VG}" &> /dev/null
+    LV="$(lvs --noheadings -o lv_name "${VG}" 2>/dev/null | tr -d ' ' | head -1)"
+    MOUNT_DEV="/dev/${VG}/${LV}"
+  else
+    MOUNT_DEV="/dev/mapper/${MAPPER}"
+  fi
+  fsck.ext4 -f "${MOUNT_DEV}" > /dev/null
+  mount "${MOUNT_DEV}" "${MNT}"
+  echo ""
+  echo "LUKS root mounted on ${MNT}"
+  echo ""
+  echo "When done, run:"
+  echo "  umount ${MNT}"
+  [ "${LVM_TYPE}" = "LVM2_member" ] && echo "  vgchange -an ${VG}"
+  echo "  cryptsetup close ${MAPPER}"
+  echo "  losetup -d ${LOOP}"
+else
+  if [ "${FS_TYPE}" = "vfat" ]; then
+    dosfsck "${LOOP}p${PARTNUM}" > /dev/null
+  elif [ "${FS_TYPE}" = "f2fs" ]; then
+    fsck.f2fs "${LOOP}p${PARTNUM}" > /dev/null
+  else
+    fsck.ext4 -f "${LOOP}p${PARTNUM}" > /dev/null
+  fi
+  [ $? -ne 0 ] && { losetup -d "${LOOP}"; errexit "Filesystem appears corrupted"; }
+  mount "${LOOP}p${PARTNUM}" "${MNT}"
+  echo ""
+  echo "${IMGFILE} partition ${PARTNUM} mounted on ${MNT}"
+  echo ""
+  echo "When done, run:"
+  echo "  umount ${MNT}"
+  echo "  losetup -d ${LOOP}"
+fi
+echo ""

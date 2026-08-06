@@ -1,0 +1,991 @@
+#!/bin/bash
+# =============================================================================
+# image-backup — x86_64 Ubuntu 24.04 / Debian 13
+# Live-system bootable .img backup with UEFI, Secure Boot, and LUKS+LVM support
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+#   Original: https://forums.raspberrypi.com/viewtopic.php?t=332000
+#   Adapted:  https://github.com/Danrancan/Image-File-Utilities-X86_64
+#
+# Supports:
+#   - Unencrypted ext4 root partitions
+#   - LUKS-encrypted LVM ext4 root partitions (Ubuntu/Debian default layout)
+#   - UEFI boot only (GPT + EFI System Partition)
+#   - Secure Boot (installs shim + signed GRUB binaries when available)
+#   - Automatic shrink of root filesystem to minimum size after initial backup
+#   - Incremental rsync updates to existing image files
+#
+# Partition layouts produced:
+#   Unencrypted (2-part):  p1=EFI(vfat 512M)  p2=root(ext4)
+#   Unencrypted (3-part):  p1=EFI(vfat 512M)  p2=/boot(ext4 1G)  p3=root(ext4)
+#   LUKS/LVM    (3-part):  p1=EFI(vfat 512M)  p2=/boot(ext4 1G)  p3=LUKS->LVM->ext4
+#
+# Usage:
+#   image-backup [options] [/path/to/existing.img]   <- incremental update
+#   image-backup -i /path/to/new.img                 <- non-interactive initial
+#   image-backup                                     <- interactive initial
+# =============================================================================
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/img-backup-mnt"
+ONEMB=$((1024 * 1024))
+
+# Global state
+LOOP=""
+MNTED=FALSE
+IMG_MAPPER_OPEN=FALSE
+IMG_LUKS_PASSPHRASE=""
+IMG_LUKS_MAPPER=""
+IMG_VG_NAME=""
+IMG_LV_NAME=""
+IMG_LV_PATH=""
+ENCRYPTED=FALSE
+THREE_PART=FALSE
+ROOT_PART_NUM=2
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+errexit()
+{
+  echo ""
+  echo -e "$1"
+  echo ""
+  _cleanup_mounts
+  rmloop
+  exit 1
+}
+
+_cleanup_mounts()
+{
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/dev/pts"  &> /dev/null
+    umount "${MNTPATH}/dev"      &> /dev/null
+    umount "${MNTPATH}/sys"      &> /dev/null
+    umount "${MNTPATH}/proc"     &> /dev/null
+    umount "${MNTPATH}/run"      &> /dev/null
+    umount "${MNTPATH}/boot/efi" &> /dev/null
+    umount "${MNTPATH}/boot"     &> /dev/null
+    umount "${MNTPATH}/"         &> /dev/null
+    MNTED=FALSE
+  fi
+  if [ "${IMG_MAPPER_OPEN}" = "TRUE" ]; then
+    _deactivate_image_lvm
+    cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+    IMG_MAPPER_OPEN=FALSE
+  fi
+  rm -rf "${MNTPATH}/" &> /dev/null
+}
+
+mkloop()
+{
+  LOOP="$(losetup -f --show -P "${IMGFILE}")"
+  [ $? -ne 0 ] && errexit "Unable to create loop device"
+}
+
+rmloop()
+{
+  if [ "${LOOP}" != "" ]; then
+    losetup -d "${LOOP}" &> /dev/null
+    LOOP=""
+  fi
+}
+
+fsckerr()
+{
+  errexit "Filesystem appears corrupted ($1 resize2fs) — run: image-check ${IMGFILE}"
+}
+
+usage()
+{
+  errexit "Usage: $0 [options] [pathto/imagefile for incremental backup]
+
+Options:
+  -h, --help        This usage description
+  -i, --initial     pathto/filename [,initial root size MB [,added space MB]]
+  -n, --noexpand    Do not auto-expand filesystem on first boot after restore
+  -o, --options     Additional rsync options (comma-separated)
+  -u, --ubuntu      Force Ubuntu mode (normally auto-detected)
+  -p, --passphrase  LUKS passphrase for the image (avoids interactive prompt)
+                    Only used when the live root is LUKS-encrypted"
+}
+
+check_dep()
+{
+  local DEP="$1" PKG="$2"
+  if ! command -v "${DEP}" &> /dev/null; then
+    echo ""
+    echo "Required tool not found: ${DEP}"
+    echo -n "Ok to install ${PKG} now (y/n)? "
+    while read -r -n 1 -s answer; do
+      if [[ "${answer}" = [yYnN] ]]; then
+        echo "${answer}"
+        if [[ "${answer}" = [yY] ]]; then
+          break
+        else
+          errexit "Aborted — please install: apt-get install ${PKG}"
+        fi
+      fi
+    done
+    echo ""
+    apt-get update -qq
+    apt-get install -y "${PKG}"
+    command -v "${DEP}" &> /dev/null || errexit "Installation of ${PKG} failed"
+  fi
+}
+
+# =============================================================================
+# ENCRYPTION DETECTION
+# Sets: ENCRYPTED, LUKS_DEV, LUKS_UUID, MAPPER_NAME, VG_NAME, LV_NAME, LV_PATH
+# =============================================================================
+
+detect_encryption()
+{
+  ENCRYPTED=FALSE
+  local DEVTYPE
+  DEVTYPE="$(lsblk -no TYPE "${ROOT_PART}" 2>/dev/null | head -1)"
+
+  if [[ "${DEVTYPE}" = "lvm" || "${DEVTYPE}" = "dm" ]]; then
+    # Root is an LVM logical volume — walk the device chain for a crypt layer
+    local CHAIN
+    CHAIN="$(lsblk -sno NAME,TYPE "${ROOT_PART}" 2>/dev/null)"
+    if echo "${CHAIN}" | grep -q "crypt"; then
+      ENCRYPTED=TRUE
+      local CRYPT_DM
+      CRYPT_DM="$(echo "${CHAIN}" | awk '$2=="crypt"{print $1}' | head -1)"
+      MAPPER_NAME="${CRYPT_DM}"
+      # Find the underlying block device of the crypt mapper
+      local RAW
+      RAW="$(dmsetup deps -o devname "/dev/mapper/${CRYPT_DM}" 2>/dev/null \
+             | sed 's/.*(\([^)]*\)).*/\1/' | tr -d ' ')"
+      LUKS_DEV="/dev/${RAW}"
+      LUKS_UUID="$(blkid -s UUID -o value "${LUKS_DEV}" 2>/dev/null)"
+      VG_NAME="$(lvs --noheadings -o vg_name "${ROOT_PART}" 2>/dev/null | tr -d ' ')"
+      LV_NAME="$(lvs --noheadings -o lv_name "${ROOT_PART}" 2>/dev/null | tr -d ' ')"
+      LV_PATH="${ROOT_PART}"
+    fi
+  fi
+
+  if [ "${ENCRYPTED}" = "FALSE" ]; then
+    local RAW_TYPE
+    RAW_TYPE="$(blkid "${ROOT_PART}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+    if [ "${RAW_TYPE}" = "crypto_LUKS" ]; then
+      ENCRYPTED=TRUE
+      LUKS_DEV="${ROOT_PART}"
+      LUKS_UUID="$(blkid -s UUID -o value "${LUKS_DEV}" 2>/dev/null)"
+      MAPPER_NAME="$(awk '!/^[[:space:]]*#/ && /UUID='"${LUKS_UUID}"'/{print $1}' \
+                    /etc/crypttab 2>/dev/null | head -1)"
+      [ -z "${MAPPER_NAME}" ] && MAPPER_NAME="crypt_root"
+      LV_PATH="/dev/mapper/${MAPPER_NAME}"
+      VG_NAME=""
+      LV_NAME=""
+    fi
+  fi
+
+  if [ "${ENCRYPTED}" = "TRUE" ]; then
+    echo "  Encrypted root detected:"
+    echo "    LUKS device : ${LUKS_DEV}"
+    echo "    LUKS UUID   : ${LUKS_UUID}"
+    echo "    Mapper name : ${MAPPER_NAME}"
+    [ -n "${VG_NAME}" ] && echo "    LVM VG      : ${VG_NAME}"
+    [ -n "${LV_NAME}" ] && echo "    LVM LV      : ${LV_NAME}"
+  fi
+}
+
+# =============================================================================
+# LUKS / LVM IMAGE LIFECYCLE
+# =============================================================================
+
+# Open the LUKS container inside the image and activate its LVM VG
+# Sets: IMG_LUKS_MAPPER, IMG_VG_NAME, IMG_LV_NAME, IMG_LV_PATH
+_open_image_luks()
+{
+  IMG_LUKS_MAPPER="imgcrypt$(date +%s)"
+  echo "  Opening LUKS container in image..."
+  echo -n "${IMG_LUKS_PASSPHRASE}" | \
+    cryptsetup luksOpen "${LOOP}p${ROOT_PART_NUM}" "${IMG_LUKS_MAPPER}" --key-file=-
+  [ $? -ne 0 ] && errexit "Failed to open LUKS container in image — wrong passphrase?"
+  IMG_MAPPER_OPEN=TRUE
+
+  if [ -n "${VG_NAME}" ]; then
+    IMG_VG_NAME="${VG_NAME}img"
+    IMG_LV_NAME="${LV_NAME}"
+    vgchange -ay "${IMG_VG_NAME}" &> /dev/null
+    IMG_LV_PATH="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
+  else
+    IMG_LV_PATH="/dev/mapper/${IMG_LUKS_MAPPER}"
+  fi
+}
+
+_deactivate_image_lvm()
+{
+  if [ -n "${IMG_VG_NAME}" ]; then
+    sync
+    vgchange -an "${IMG_VG_NAME}" &> /dev/null
+  fi
+}
+
+setup_luks_image()
+{
+  echo ""
+  echo "Setting up LUKS encrypted container in image..."
+
+  if [ -z "${IMG_LUKS_PASSPHRASE}" ]; then
+    local P1 P2
+    while :; do
+      echo -n "  Enter passphrase for image LUKS container: "
+      read -rs P1; echo ""
+      echo -n "  Confirm passphrase: "
+      read -rs P2; echo ""
+      if [ "${P1}" = "${P2}" ] && [ -n "${P1}" ]; then
+        IMG_LUKS_PASSPHRASE="${P1}"
+        break
+      elif [ -z "${P1}" ]; then
+        echo "  Passphrase cannot be empty."
+      else
+        echo "  Passphrases do not match."
+      fi
+    done
+  fi
+
+  echo -n "${IMG_LUKS_PASSPHRASE}" | \
+    cryptsetup luksFormat \
+      --type luks2 \
+      --cipher aes-xts-plain64 \
+      --key-size 512 \
+      --hash sha256 \
+      --iter-time 2000 \
+      --key-file=- \
+      "${LOOP}p${ROOT_PART_NUM}"
+  [ $? -ne 0 ] && errexit "cryptsetup luksFormat failed"
+
+  _open_image_luks
+
+  if [ -n "${VG_NAME}" ]; then
+    echo "  Creating LVM inside LUKS container..."
+    pvcreate "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null || errexit "pvcreate failed"
+    vgcreate "${IMG_VG_NAME}" "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null || errexit "vgcreate failed"
+    lvcreate -l 100%FREE -n "${IMG_LV_NAME}" "${IMG_VG_NAME}" &> /dev/null || errexit "lvcreate failed"
+    IMG_LV_PATH="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
+  fi
+
+  echo "  Formatting root filesystem (ext4)..."
+  mkfs.ext4 -b 4096 -L rootfs -q "${IMG_LV_PATH}" > /dev/null || errexit "mkfs.ext4 failed"
+  echo "  LUKS container ready."
+}
+
+# =============================================================================
+# MOUNT / UNMOUNT IMAGE
+# =============================================================================
+
+mntimg()
+{
+  mkloop
+  mkdir -p "${MNTPATH}/"
+
+  if [ "${ENCRYPTED}" = "TRUE" ]; then
+    _open_image_luks
+    mount "${IMG_LV_PATH}" "${MNTPATH}/" || errexit "Unable to mount image root LV"
+  else
+    mount "${LOOP}p${ROOT_PART_NUM}" "${MNTPATH}/" || errexit "Unable to mount image ROOT"
+  fi
+  MNTED=TRUE
+
+  if [ "${THREE_PART}" = "TRUE" ]; then
+    mkdir -p "${MNTPATH}/boot/"
+    mount "${LOOP}p2" "${MNTPATH}/boot/" || errexit "Unable to mount image /boot"
+  fi
+  mkdir -p "${MNTPATH}/boot/efi/"
+  mount "${LOOP}p1" "${MNTPATH}/boot/efi/" || errexit "Unable to mount image EFI"
+}
+
+umntimg()
+{
+  umount "${MNTPATH}/boot/efi/" &> /dev/null
+  [ "${THREE_PART}" = "TRUE" ] && umount "${MNTPATH}/boot/" &> /dev/null
+  umount "${MNTPATH}/" &> /dev/null
+  MNTED=FALSE
+
+  if [ "${ENCRYPTED}" = "TRUE" ] && [ "${IMG_MAPPER_OPEN}" = "TRUE" ]; then
+    _deactivate_image_lvm
+    cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+    IMG_MAPPER_OPEN=FALSE
+  fi
+
+  rmloop
+  rm -rf "${MNTPATH}/"
+}
+
+# =============================================================================
+# GRUB / SECURE BOOT
+# =============================================================================
+
+install_grub()
+{
+  echo ""
+  echo "Installing GRUB EFI bootloader into image..."
+
+  mount --bind /dev     "${MNTPATH}/dev"
+  mount --bind /dev/pts "${MNTPATH}/dev/pts"
+  mount --bind /sys     "${MNTPATH}/sys"
+  mount -t proc proc    "${MNTPATH}/proc"
+  mount --bind /run     "${MNTPATH}/run"
+
+  if [ ! -f "${MNTPATH}/usr/sbin/grub-install" ]; then
+    echo "  Installing grub-efi-amd64 in image chroot..."
+    chroot "${MNTPATH}" apt-get install -y --no-install-recommends \
+      grub-efi-amd64 grub-efi-amd64-bin &> /dev/null
+  fi
+
+  # Secure Boot: try to install shim-signed
+  if chroot "${MNTPATH}" dpkg -l shim-signed &> /dev/null; then
+    echo "  Secure Boot: shim-signed present."
+    chroot "${MNTPATH}" apt-get install -y --no-install-recommends \
+      shim-signed &> /dev/null
+  else
+    echo "  Secure Boot: shim-signed not available; image will use unsigned GRUB."
+    echo "  (Install shim-signed on the live system and re-run for Secure Boot support.)"
+  fi
+
+  chroot "${MNTPATH}" grub-install \
+    --target=x86_64-efi \
+    --efi-directory=/boot/efi \
+    --boot-directory=/boot \
+    --no-nvram \
+    --removable \
+    "${LOOP}" &> /dev/null
+  [ $? -ne 0 ] && echo "  WARNING: grub-install non-zero exit (may be harmless in offline chroot)."
+
+  if [ "${ENCRYPTED}" = "TRUE" ]; then
+    _configure_grub_for_luks
+    echo "  Rebuilding initramfs for LUKS/LVM..."
+    chroot "${MNTPATH}" update-initramfs -u -k all &> /dev/null || \
+      echo "  WARNING: update-initramfs failed — manual rebuild may be needed."
+  fi
+
+  chroot "${MNTPATH}" update-grub &> /dev/null
+
+  umount "${MNTPATH}/run"     &> /dev/null
+  umount "${MNTPATH}/proc"    &> /dev/null
+  umount "${MNTPATH}/sys"     &> /dev/null
+  umount "${MNTPATH}/dev/pts" &> /dev/null
+  umount "${MNTPATH}/dev"     &> /dev/null
+
+  echo "  GRUB installation complete."
+}
+
+_configure_grub_for_luks()
+{
+  local IMG_LUKS_UUID
+  IMG_LUKS_UUID="$(blkid -s UUID -o value "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
+
+  # GRUB root device string using doubled-hyphen convention for LVM
+  local ROOT_MAPPER_GRUB
+  if [ -n "${IMG_VG_NAME}" ]; then
+    local VG_GRUB="${IMG_VG_NAME//-/--}"
+    local LV_GRUB="${IMG_LV_NAME//-/--}"
+    ROOT_MAPPER_GRUB="/dev/mapper/${VG_GRUB}-${LV_GRUB}"
+  else
+    ROOT_MAPPER_GRUB="/dev/mapper/${IMG_LUKS_MAPPER}"
+  fi
+
+  local GRUB_DEFAULT="${MNTPATH}/etc/default/grub"
+  if [ -f "${GRUB_DEFAULT}" ]; then
+    # Clean any prior crypto params
+    sed -i 's|cryptdevice=[^ "]*||g' "${GRUB_DEFAULT}"
+    sed -i 's|rd\.luks\.uuid=[^ "]*||g' "${GRUB_DEFAULT}"
+    # Inject crypto kernel params into GRUB_CMDLINE_LINUX
+    sed -i "s|^GRUB_CMDLINE_LINUX=\"\(.*\)\"|GRUB_CMDLINE_LINUX=\"\1 cryptdevice=UUID=${IMG_LUKS_UUID}:${IMG_LUKS_MAPPER} root=${ROOT_MAPPER_GRUB}\"|" \
+      "${GRUB_DEFAULT}"
+    # Enable GRUB cryptodisk module (needed to unlock LUKS before loading kernel)
+    grep -q "GRUB_ENABLE_CRYPTODISK" "${GRUB_DEFAULT}" || \
+      echo 'GRUB_ENABLE_CRYPTODISK=y' >> "${GRUB_DEFAULT}"
+    grep -q "GRUB_PRELOAD_MODULES" "${GRUB_DEFAULT}" || \
+      echo 'GRUB_PRELOAD_MODULES="part_gpt luks2 cryptodisk lvm"' >> "${GRUB_DEFAULT}"
+  fi
+
+  _update_image_crypttab "${IMG_LUKS_UUID}"
+}
+
+# =============================================================================
+# FSTAB / CRYPTTAB FIXUP
+# =============================================================================
+
+_update_image_fstab()
+{
+  local FSTAB="${MNTPATH}/etc/fstab"
+  [ -f "${FSTAB}" ] || return
+
+  local IMG_EFI_UUID IMG_BOOT_UUID
+  IMG_EFI_UUID="$(blkid -s UUID -o value "${LOOP}p1" 2>/dev/null)"
+  [ "${THREE_PART}" = "TRUE" ] && IMG_BOOT_UUID="$(blkid -s UUID -o value "${LOOP}p2" 2>/dev/null)"
+
+  # EFI partition
+  if [ -n "${IMG_EFI_UUID}" ]; then
+    sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/boot/efi\s\)|UUID=${IMG_EFI_UUID}\1|" "${FSTAB}"
+  fi
+
+  # /boot partition
+  if [ "${THREE_PART}" = "TRUE" ] && [ -n "${IMG_BOOT_UUID}" ]; then
+    sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/boot\s\)|UUID=${IMG_BOOT_UUID}\1|" "${FSTAB}"
+  fi
+
+  # Root partition / LV
+  if [ "${ENCRYPTED}" = "TRUE" ]; then
+    if [ -n "${IMG_VG_NAME}" ]; then
+      local VG_FSTAB="${IMG_VG_NAME//-/--}"
+      local LV_FSTAB="${IMG_LV_NAME//-/--}"
+      local ROOT_MAP="/dev/mapper/${VG_FSTAB}-${LV_FSTAB}"
+      sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/\s\+ext4\)|${ROOT_MAP}\1|" "${FSTAB}"
+    else
+      local MAP_UUID
+      MAP_UUID="$(blkid -s UUID -o value "${IMG_LV_PATH}" 2>/dev/null)"
+      [ -n "${MAP_UUID}" ] && \
+        sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/\s\)|UUID=${MAP_UUID}\1|" "${FSTAB}"
+    fi
+  else
+    local IMG_ROOT_UUID
+    IMG_ROOT_UUID="$(blkid -s UUID -o value "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
+    [ -n "${IMG_ROOT_UUID}" ] && \
+      sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/\s\)|UUID=${IMG_ROOT_UUID}\1|" "${FSTAB}"
+  fi
+}
+
+_update_image_crypttab()
+{
+  local IMG_LUKS_UUID="$1"
+  cat > "${MNTPATH}/etc/crypttab" << EOF
+# /etc/crypttab - generated by image-backup
+# Unlock LUKS container to access LVM root volume
+${IMG_LUKS_MAPPER}   UUID=${IMG_LUKS_UUID}   none   luks,discard
+EOF
+}
+
+# =============================================================================
+# RESIZE-ON-RESTORE systemd SERVICE
+# =============================================================================
+
+inject_resize_service()
+{
+  local SVCFILE="${MNTPATH}/etc/systemd/system/resize-root-fs.service"
+  local SCRIPTFILE="${MNTPATH}/usr/local/sbin/resize-root-fs"
+  [ -f "${SVCFILE}" ] && return
+
+  if [ "${ENCRYPTED}" = "TRUE" ] && [ -n "${VG_NAME}" ]; then
+    cat > "${SCRIPTFILE}" << 'SCRIPT'
+#!/bin/bash
+# Expand LVM LV and filesystem to fill all free space in VG
+VG="$(lvs --noheadings -o vg_name / 2>/dev/null | tr -d ' ' | head -1)"
+LV="$(lvs --noheadings -o lv_name / 2>/dev/null | tr -d ' ' | head -1)"
+if [ -n "${VG}" ] && [ -n "${LV}" ]; then
+  lvextend -l +100%FREE "${VG}/${LV}" &> /dev/null
+  resize2fs "/dev/${VG}/${LV}"
+fi
+systemctl disable resize-root-fs.service
+rm -f /etc/systemd/system/resize-root-fs.service
+rm -f /usr/local/sbin/resize-root-fs
+SCRIPT
+  else
+    cat > "${SCRIPTFILE}" << 'SCRIPT'
+#!/bin/bash
+# Expand GPT partition and ext4 filesystem to fill disk
+ROOT_PART="$(mount | sed -n 's|^\(/dev/[^ ]*\) on / .*|\1|p' | head -1)"
+ROOT_DEV="$(lsblk -no pkname "${ROOT_PART}" 2>/dev/null)"
+ROOT_DEV="/dev/${ROOT_DEV}"
+PARTNUM="$(echo "${ROOT_PART}" | grep -o '[0-9]*$')"
+START="$(sfdisk -d "${ROOT_DEV}" | grep "p\?${PARTNUM}\s" | sed 's/.*start= *\([0-9]*\).*/\1/')"
+PARTUUID="$(blkid "${ROOT_PART}" | sed -n 's|.*PARTUUID="\([^"]*\)".*|\1|p')"
+sgdisk -d "${PARTNUM}" "${ROOT_DEV}" > /dev/null
+sgdisk -n "${PARTNUM}:${START}:0" -t "${PARTNUM}:8300" "${ROOT_DEV}" > /dev/null
+[ -n "${PARTUUID}" ] && sgdisk -u "${PARTNUM}:${PARTUUID}" "${ROOT_DEV}" > /dev/null
+partprobe "${ROOT_DEV}" 2>/dev/null
+sleep 1
+resize2fs "${ROOT_PART}"
+systemctl disable resize-root-fs.service
+rm -f /etc/systemd/system/resize-root-fs.service
+rm -f /usr/local/sbin/resize-root-fs
+SCRIPT
+  fi
+  chmod +x "${SCRIPTFILE}"
+
+  cat > "${SVCFILE}" << 'SVC'
+[Unit]
+Description=Resize root filesystem to fill disk on first boot after restore
+DefaultDependencies=no
+Before=local-fs.target
+After=systemd-remount-fs.service
+ConditionPathExists=/usr/local/sbin/resize-root-fs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/resize-root-fs
+RemainAfterExit=yes
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+  mkdir -p "${MNTPATH}/etc/systemd/system/multi-user.target.wants/"
+  ln -sf /etc/systemd/system/resize-root-fs.service \
+         "${MNTPATH}/etc/systemd/system/multi-user.target.wants/resize-root-fs.service"
+}
+
+# =============================================================================
+# RSYNC BACKUP CORE
+# =============================================================================
+
+backup()
+{
+  mntimg
+  sync
+
+  local EXCL=(
+    "--exclude=${MNTPATH}"
+    "--exclude=/dev"
+    "--exclude=/lost+found"
+    "--exclude=/media"
+    "--exclude=/mnt"
+    "--exclude=/proc"
+    "--exclude=/run"
+    "--exclude=/sys"
+    "--exclude=/tmp"
+    "--exclude=/var/swap"
+    "--exclude=/var/cache/apt/archives"
+    "--exclude=/etc/udev/rules.d/70-persistent-net.rules"
+    "--exclude=/var/lib/asterisk/astdb.sqlite3-journal"
+  )
+
+  echo "  Running rsync..."
+  rsync -aHDx --partial --numeric-ids --delete --force \
+    "${EXCL[@]}" "${OPTIONS[@]}" \
+    / "${MNTPATH}/"
+  local RC=$?
+  if [[ ${RC} -ne 0 && ${RC} -ne 24 ]]; then
+    errexit "rsync failed (exit code: ${RC})"
+  fi
+
+  # Recreate excluded virtual dirs
+  mkdir -p "${MNTPATH}/dev/" "${MNTPATH}/lost+found/" "${MNTPATH}/media/" \
+           "${MNTPATH}/mnt/" "${MNTPATH}/proc/"       "${MNTPATH}/run/"  \
+           "${MNTPATH}/sys/" "${MNTPATH}/tmp/"
+  chmod a+rwxt "${MNTPATH}/tmp/"
+
+  _update_image_fstab
+
+  [ "${NOEXPAND}" = "FALSE" ] && inject_resize_service
+
+  sync
+  umntimg
+
+  # Copy filesystem labels
+  mkloop
+  fatlabel "${LOOP}p1" "$(fatlabel "${LIVE_EFI_DEV}" 2>/dev/null | tail -1)" &> /dev/null
+  if [ "${THREE_PART}" = "TRUE" ] && [ -n "${LIVE_BOOT_DEV}" ]; then
+    e2label "${LOOP}p2" "$(e2label "${LIVE_BOOT_DEV}" 2>/dev/null)" &> /dev/null
+  fi
+  if [ "${ENCRYPTED}" = "FALSE" ]; then
+    e2label "${LOOP}p${ROOT_PART_NUM}" "$(e2label "${ROOT_PART}" 2>/dev/null)" &> /dev/null
+  fi
+  rmloop
+}
+
+# =============================================================================
+# SHRINK ROOT FILESYSTEM TO MINIMUM
+# =============================================================================
+
+shrink_root_filesystem()
+{
+  echo ""
+  echo "Shrinking root filesystem to minimum size..."
+
+  if [ "${ENCRYPTED}" = "TRUE" ] && [ -n "${VG_NAME}" ]; then
+    _shrink_luks_lvm
+  elif [ "${ENCRYPTED}" = "TRUE" ]; then
+    _shrink_luks_direct
+  else
+    _shrink_plain_ext4
+  fi
+
+  echo "  Shrink complete."
+  echo "  Image size on disk: $(du -h "${IMGFILE}" | cut -f1)"
+}
+
+_shrink_plain_ext4()
+{
+  mkloop
+  e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "before"
+  echo ""
+  # Three passes ensures maximum shrink
+  resize2fs -f -M "${LOOP}p${ROOT_PART_NUM}"
+  resize2fs -f -M "${LOOP}p${ROOT_PART_NUM}"
+  resize2fs -f -M "${LOOP}p${ROOT_PART_NUM}"
+  e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "after"
+
+  local INFO NEWSIZE BLKSIZE START NEWEND
+  INFO="$(tune2fs -l "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
+  NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  START="$(sfdisk -d "${IMGFILE}" | grep -E "[[:space:]]p?${ROOT_PART_NUM}[[:space:]]" \
+           | sed 's/.*start= *\([0-9]*\).*/\1/')"
+  NEWEND=$(( START + (NEWSIZE * (BLKSIZE / 512)) + ((ADDMB * ONEMB) / 512) - 1 + 33 ))
+
+  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+  _rebuild_gpt "${START}" "8300" "Linux root"
+
+  if [ "${ADDMB}" -ne 0 ]; then
+    e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "before expand"
+    resize2fs -f "${LOOP}p${ROOT_PART_NUM}"
+    e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "after expand"
+  fi
+  rmloop
+}
+
+_shrink_luks_lvm()
+{
+  mkloop
+  _open_image_luks
+
+  local LV_DEV="${IMG_LV_PATH}"
+  echo "  Phase 1: Shrink ext4 on LV..."
+  e2fsck -f -n "${LV_DEV}" || { _deactivate_image_lvm; cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "before"; }
+  echo ""
+  resize2fs -f -M "${LV_DEV}"
+  resize2fs -f -M "${LV_DEV}"
+  resize2fs -f -M "${LV_DEV}"
+  e2fsck -f -n "${LV_DEV}" || { _deactivate_image_lvm; cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "after"; }
+
+  local INFO NEWSIZE BLKSIZE
+  INFO="$(tune2fs -l "${LV_DEV}" 2>/dev/null)"
+  NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  local NEW_LV_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
+
+  echo "  Phase 2: Reduce LV..."
+  lvreduce --force -L "${NEW_LV_BYTES}B" "${IMG_VG_NAME}/${IMG_LV_NAME}" &> /dev/null
+
+  echo "  Phase 3: Resize LVM PV..."
+  local NEW_PV_BYTES=$(( NEW_LV_BYTES + (32 * ONEMB) ))
+  pvresize --setphysicalvolumesize "${NEW_PV_BYTES}B" \
+    "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null
+
+  echo "  Phase 4: Resize LUKS data area..."
+  local NEW_LUKS_SECTORS=$(( (NEW_PV_BYTES + (4 * ONEMB)) / 512 ))
+  cryptsetup resize --size "${NEW_LUKS_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+
+  echo "  Phase 5: Deactivate and close LUKS..."
+  _deactivate_image_lvm
+  cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  IMG_MAPPER_OPEN=FALSE
+
+  echo "  Phase 6: Truncate image file and fix GPT..."
+  local START
+  START="$(sfdisk -d "${IMGFILE}" | grep -E "[[:space:]]p?${ROOT_PART_NUM}[[:space:]]" \
+           | sed 's/.*start= *\([0-9]*\).*/\1/')"
+  local NEWEND=$(( START + NEW_LUKS_SECTORS + 33 ))
+  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+  _rebuild_gpt "${START}" "8309" "Linux LUKS"
+  rmloop
+}
+
+_shrink_luks_direct()
+{
+  mkloop
+  _open_image_luks
+  local CDEV="/dev/mapper/${IMG_LUKS_MAPPER}"
+
+  e2fsck -f -n "${CDEV}" || { cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "before"; }
+  resize2fs -f -M "${CDEV}"
+  resize2fs -f -M "${CDEV}"
+  resize2fs -f -M "${CDEV}"
+  e2fsck -f -n "${CDEV}" || { cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "after"; }
+
+  local INFO NEWSIZE BLKSIZE
+  INFO="$(tune2fs -l "${CDEV}" 2>/dev/null)"
+  NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  local NEW_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
+  local NEW_SECTORS=$(( NEW_BYTES / 512 ))
+
+  cryptsetup resize --size "${NEW_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+  cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  IMG_MAPPER_OPEN=FALSE
+
+  local START
+  START="$(sfdisk -d "${IMGFILE}" | grep -E "[[:space:]]p?${ROOT_PART_NUM}[[:space:]]" \
+           | sed 's/.*start= *\([0-9]*\).*/\1/')"
+  local NEWEND=$(( START + NEW_SECTORS + 33 ))
+  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+  _rebuild_gpt "${START}" "8309" "Linux LUKS"
+  rmloop
+}
+
+# Relocate GPT backup header and fix the root partition entry
+_rebuild_gpt()
+{
+  local ROOT_START="$1" PART_TYPE="$2" PART_LABEL="$3"
+  sgdisk -e "${IMGFILE}" &> /dev/null
+  sgdisk -d "${ROOT_PART_NUM}" "${IMGFILE}" &> /dev/null
+  sgdisk -n "${ROOT_PART_NUM}:${ROOT_START}:0" \
+         -t "${ROOT_PART_NUM}:${PART_TYPE}" \
+         -c "${ROOT_PART_NUM}:${PART_LABEL}" \
+         "${IMGFILE}" &> /dev/null
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ "$(id -u)" -ne 0 ]; then
+  errexit "$0 must be run as root user"
+fi
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+# Core dependency checks
+check_dep gdisk      gdisk
+check_dep sgdisk     gdisk
+check_dep rsync      rsync
+check_dep resize2fs  e2fsprogs
+check_dep e2fsck     e2fsprogs
+check_dep mkfs.vfat  dosfstools
+check_dep mkfs.ext4  e2fsprogs
+check_dep lsblk      util-linux
+check_dep blkid      util-linux
+check_dep grub-install grub-efi-amd64
+
+OSID="$(sed -n 's|^ID=\(.*\)|\1|p' /etc/os-release)"
+
+echo ""
+echo "Detecting system layout..."
+
+ROOT_PART="$(mount | sed -n 's|^\(/dev/[^ ]*\) on / .*|\1|p' | head -1)"
+[ -z "${ROOT_PART}" ] && errexit "Cannot detect root partition"
+
+detect_encryption
+
+if [ "${ENCRYPTED}" = "TRUE" ]; then
+  check_dep cryptsetup cryptsetup
+  check_dep pvs        lvm2
+  check_dep lvs        lvm2
+  check_dep lvreduce   lvm2
+  check_dep pvresize   lvm2
+  check_dep vgchange   lvm2
+  check_dep lvcreate   lvm2
+  check_dep vgcreate   lvm2
+  check_dep pvcreate   lvm2
+fi
+
+# Determine root disk
+if [ "${ENCRYPTED}" = "TRUE" ]; then
+  ROOT_DISK="/dev/$(lsblk -no pkname "${LUKS_DEV}" 2>/dev/null | head -1)"
+else
+  ROOT_DISK="/dev/$(lsblk -no pkname "${ROOT_PART}" 2>/dev/null | head -1)"
+fi
+[ "${ROOT_DISK}" = "/dev/" ] && errexit "Cannot determine root disk device"
+
+# Partition layout
+if [ "${ENCRYPTED}" = "TRUE" ]; then
+  # LUKS systems must have a separate unencrypted /boot for GRUB
+  THREE_PART=TRUE
+elif grep -qsE '^\S+\s+/boot\s+ext[2-4]' /etc/fstab; then
+  THREE_PART=TRUE
+fi
+
+if [ "${THREE_PART}" = "TRUE" ]; then
+  ROOT_PART_NUM=3
+  EFI_SIZE_MB=512
+  BOOT_SIZE_MB=1024
+  LIVE_EFI_DEV="$(awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {print $1}' /etc/fstab | head -1)"
+  LIVE_BOOT_DEV="$(awk '!/^[[:space:]]*#/ && $2=="/boot" && $3~/ext/ {print $1}' /etc/fstab | head -1)"
+else
+  ROOT_PART_NUM=2
+  EFI_SIZE_MB=512
+  BOOT_SIZE_MB=0
+  LIVE_EFI_DEV="$(awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {print $1}' /etc/fstab | head -1)"
+  LIVE_BOOT_DEV=""
+fi
+
+resolve_dev()
+{
+  local spec="$1"
+  if [[ "${spec}" =~ ^UUID= ]];     then blkid -U "${spec#UUID=}" 2>/dev/null
+  elif [[ "${spec}" =~ ^PARTUUID= ]]; then blkid -t "PARTUUID=${spec#PARTUUID=}" -o device 2>/dev/null | head -1
+  else echo "${spec}"; fi
+}
+LIVE_EFI_DEV="$(resolve_dev "${LIVE_EFI_DEV}")"
+[ "${THREE_PART}" = "TRUE" ] && LIVE_BOOT_DEV="$(resolve_dev "${LIVE_BOOT_DEV}")"
+
+echo "  OS             : ${OSID}"
+echo "  Root partition : ${ROOT_PART}"
+echo "  Root disk      : ${ROOT_DISK}"
+echo "  Layout         : $([ "${THREE_PART}" = "TRUE" ] && echo "3-part (EFI+boot+root)" || echo "2-part (EFI+root)")"
+echo "  Encrypted      : ${ENCRYPTED}"
+
+DFKFREE="$(df / | awk 'NR==2{print $3}')"
+INISIZE=$(( (DFKFREE + (DFKFREE / 5)) / 1024 ))
+
+IMGNAME="" IMGSIZE="" IMGINCR="" IMGFILE=""
+OPTIONS=() NOEXPAND=FALSE ADDMB=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)       usage ;;
+    -i|--initial)
+      OIFS=${IFS}; IFS=','
+      INITIAL=($2); IFS=${OIFS}
+      IMGNAME="${INITIAL[0]}"
+      IMGSIZE="${INITIAL[1]}"
+      IMGINCR="${INITIAL[2]}"
+      shift 2 ;;
+    -n|--noexpand)   NOEXPAND=TRUE; shift ;;
+    -o|--options)
+      OIFS=${IFS}; IFS=','
+      OPTIONS+=($2); IFS=${OIFS}
+      shift 2 ;;
+    -u|--ubuntu)     OSID="ubuntu"; shift ;;
+    -p|--passphrase) IMG_LUKS_PASSPHRASE="$2"; shift 2 ;;
+    -*|--*)          usage ;;
+    *)               IMGFILE="$1"; shift ;;
+  esac
+done
+
+# =============================================================================
+# INITIAL BACKUP
+# =============================================================================
+if [ -z "${IMGFILE}" ]; then
+
+  if [ -n "${IMGNAME}" ]; then
+    IMGFILE="${IMGNAME}"
+    [ -d "${IMGFILE}" ] && errexit "${IMGFILE} is a directory"
+    [ -z "${IMGSIZE}" ] && IMGSIZE=${INISIZE}
+    IRFSSIZE="${IMGSIZE}"
+    [ -z "${IMGINCR}" ] && IMGINCR=0
+    ADDMB="${IMGINCR}"
+  else
+    while :; do
+      echo ""
+      read -r -e -i "${IMGFILE}" -p "Image file to create? " IMGFILE
+      [ -z "${IMGFILE}" ] && continue
+      if [ -d "${IMGFILE}" ]; then
+        echo ""; echo "${IMGFILE} is a directory"
+      elif [ -f "${IMGFILE}" ]; then
+        echo ""
+        echo -n "${IMGFILE} already exists, Ok to delete (y/n)? "
+        while read -r -n 1 -s a; do
+          if [[ "${a}" = [yYnN] ]]; then
+            echo "${a}"
+            [[ "${a}" = [yY] ]] && break 2 || break 1
+          fi
+        done
+      else
+        break
+      fi
+    done
+    echo ""
+    read -r -e -p "Initial image file ROOT filesystem size (MB) [${INISIZE}]? " IRFSSIZE
+    [ -z "${IRFSSIZE}" ] && IRFSSIZE=${INISIZE}
+    echo ""
+    read -r -e -p "Added space for incremental updates after shrinking (MB) [0]? " ADDMB
+    [ -z "${ADDMB}" ] && ADDMB=0
+    echo ""
+    echo -n "Create ${IMGFILE} (y/n)? "
+    while read -r -n 1 -s a; do
+      if [[ "${a}" = [yYnN] ]]; then
+        echo "${a}"
+        [[ "${a}" = [yY] ]] && break || errexit "Aborted"
+      fi
+    done
+  fi
+
+  [ -f "${IMGFILE}" ] && { rm "${IMGFILE}" || errexit "Unable to delete existing image file"; }
+
+  TOTAL_MB=$(( IRFSSIZE + EFI_SIZE_MB + BOOT_SIZE_MB ))
+  truncate -s $(( TOTAL_MB * ONEMB )) "${IMGFILE}" || errexit "Unable to create image file"
+
+  # Partition — GPT only, UEFI only
+  sgdisk -Z "${IMGFILE}" &> /dev/null
+  sgdisk -n 1:0:+${EFI_SIZE_MB}M  -t 1:ef00 -c 1:"EFI System"  "${IMGFILE}" &> /dev/null
+  if [ "${THREE_PART}" = "TRUE" ]; then
+    sgdisk -n 2:0:+${BOOT_SIZE_MB}M -t 2:8300 -c 2:"Linux boot" "${IMGFILE}" &> /dev/null
+    if [ "${ENCRYPTED}" = "TRUE" ]; then
+      sgdisk -n 3:0:0               -t 3:8309 -c 3:"Linux LUKS" "${IMGFILE}" &> /dev/null
+    else
+      sgdisk -n 3:0:0               -t 3:8300 -c 3:"Linux root" "${IMGFILE}" &> /dev/null
+    fi
+  else
+    sgdisk -n 2:0:0                 -t 2:8300 -c 2:"Linux root" "${IMGFILE}" &> /dev/null
+  fi
+
+  # Format partitions
+  mkloop
+  mkfs.vfat -F 32 -n "EFI" "${LOOP}p1" &> /dev/null || errexit "Unable to create EFI filesystem"
+  dosfsck "${LOOP}p1" > /dev/null
+  [ "${THREE_PART}" = "TRUE" ] && \
+    mkfs.ext4 -b 4096 -L boot -q "${LOOP}p2" > /dev/null || true
+  [ "${ENCRYPTED}" = "FALSE" ] && \
+    mkfs.ext4 -b 4096 -L rootfs -q "${LOOP}p${ROOT_PART_NUM}" > /dev/null || true
+  rmloop
+
+  # LUKS setup (if encrypted)
+  if [ "${ENCRYPTED}" = "TRUE" ]; then
+    mkloop
+    setup_luks_image
+    # Close here — backup()->mntimg() will reopen
+    _deactivate_image_lvm
+    cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+    IMG_MAPPER_OPEN=FALSE
+    rmloop
+  fi
+
+  echo ""
+  echo "Starting full backup..."
+  echo "(For incremental updates: $0 ${IMGFILE})"
+  backup
+
+  # Install GRUB EFI (+ Secure Boot shim if available)
+  mntimg
+  install_grub
+  umntimg
+
+  # Shrink root to minimum size
+  shrink_root_filesystem
+
+  echo ""
+
+else
+
+  # =============================================================================
+  # INCREMENTAL UPDATE
+  # =============================================================================
+  [ -d "${IMGFILE}" ] && errexit "${IMGFILE} is a directory"
+  [ ! -f "${IMGFILE}" ] && errexit "${IMGFILE} not found"
+
+  # Detect image layout from the file itself
+  LOOP_TMP="$(losetup -f --show -P "${IMGFILE}")"
+  NUM_PARTS="$(lsblk -no NAME "${LOOP_TMP}" 2>/dev/null | grep -c 'p[0-9]')"
+  losetup -d "${LOOP_TMP}"
+  if [ "${NUM_PARTS}" -ge 3 ]; then
+    THREE_PART=TRUE; ROOT_PART_NUM=3
+  else
+    THREE_PART=FALSE; ROOT_PART_NUM=2
+  fi
+
+  backup
+
+fi
+
+sync
+echo ""
+echo "====================================================="
+echo "Backup complete : ${IMGFILE}"
+echo "Image size      : $(du -h "${IMGFILE}" 2>/dev/null | cut -f1)"
+echo "====================================================="
+echo ""
