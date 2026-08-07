@@ -5,6 +5,48 @@
 # Based on RonR's Image File Utilities for Raspberry Pi
 # Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
 
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
 trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
 
 MNTPATH="/tmp/image-chroot-mnt"
@@ -65,7 +107,8 @@ done
 # Detect image layout
 LOOP="$(losetup -f --show -P "${IMGFILE}")"
 [ $? -ne 0 ] && errexit "Unable to create loop device"
-NUM_PARTS="$(lsblk -no NAME "${LOOP}" 2>/dev/null | grep -c 'p[0-9]')"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
+NUM_PARTS="$(count_parts "${IMGFILE}")"
 ROOT_PART_NUM="${NUM_PARTS}"
 
 THREE_PART=FALSE

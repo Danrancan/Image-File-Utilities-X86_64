@@ -26,6 +26,48 @@
 #   image-backup                                     <- interactive initial
 # =============================================================================
 
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
 trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
 
 MNTPATH="/tmp/img-backup-mnt"
@@ -83,6 +125,7 @@ mkloop()
 {
   LOOP="$(losetup -f --show -P "${IMGFILE}")"
   [ $? -ne 0 ] && errexit "Unable to create loop device"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
 }
 
 rmloop()
@@ -628,8 +671,10 @@ _shrink_plain_ext4()
   INFO="$(tune2fs -l "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
   NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
   BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
-  START="$(sfdisk -d "${IMGFILE}" | grep -E "[[:space:]]p?${ROOT_PART_NUM}[[:space:]]" \
-           | sed 's/.*start= *\([0-9]*\).*/\1/')"
+  START="$(part_start "${IMGFILE}" "${ROOT_PART_NUM}")"
+  if ! [[ "${START}" =~ ^[0-9]+$ ]] || [ "${START}" -lt 2048 ]; then
+    errexit "Could not read partition ${ROOT_PART_NUM} start sector from ${IMGFILE}.\nAborting before truncate to avoid corrupting the image."
+  fi
   NEWEND=$(( START + (NEWSIZE * (BLKSIZE / 512)) + ((ADDMB * ONEMB) / 512) - 1 + 33 ))
 
   truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
@@ -682,8 +727,10 @@ _shrink_luks_lvm()
 
   echo "  Phase 6: Truncate image file and fix GPT..."
   local START
-  START="$(sfdisk -d "${IMGFILE}" | grep -E "[[:space:]]p?${ROOT_PART_NUM}[[:space:]]" \
-           | sed 's/.*start= *\([0-9]*\).*/\1/')"
+  START="$(part_start "${IMGFILE}" "${ROOT_PART_NUM}")"
+  if ! [[ "${START}" =~ ^[0-9]+$ ]] || [ "${START}" -lt 2048 ]; then
+    errexit "Could not read partition ${ROOT_PART_NUM} start sector from ${IMGFILE}.\nAborting before truncate to avoid corrupting the image."
+  fi
   local NEWEND=$(( START + NEW_LUKS_SECTORS + 33 ))
   truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
   _rebuild_gpt "${START}" "8309" "Linux LUKS"
@@ -714,8 +761,10 @@ _shrink_luks_direct()
   IMG_MAPPER_OPEN=FALSE
 
   local START
-  START="$(sfdisk -d "${IMGFILE}" | grep -E "[[:space:]]p?${ROOT_PART_NUM}[[:space:]]" \
-           | sed 's/.*start= *\([0-9]*\).*/\1/')"
+  START="$(part_start "${IMGFILE}" "${ROOT_PART_NUM}")"
+  if ! [[ "${START}" =~ ^[0-9]+$ ]] || [ "${START}" -lt 2048 ]; then
+    errexit "Could not read partition ${ROOT_PART_NUM} start sector from ${IMGFILE}.\nAborting before truncate to avoid corrupting the image."
+  fi
   local NEWEND=$(( START + NEW_SECTORS + 33 ))
   truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
   _rebuild_gpt "${START}" "8309" "Linux LUKS"
@@ -970,7 +1019,8 @@ else
 
   # Detect image layout from the file itself
   LOOP_TMP="$(losetup -f --show -P "${IMGFILE}")"
-  NUM_PARTS="$(lsblk -no NAME "${LOOP_TMP}" 2>/dev/null | grep -c 'p[0-9]')"
+  loop_settle "${LOOP_TMP}" || errexit "Loop partition devices did not appear"
+  NUM_PARTS="$(count_parts "${IMGFILE}")"
   losetup -d "${LOOP_TMP}"
   if [ "${NUM_PARTS}" -ge 3 ]; then
     THREE_PART=TRUE; ROOT_PART_NUM=3

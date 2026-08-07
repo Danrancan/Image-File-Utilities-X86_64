@@ -35,7 +35,7 @@ echo "Checking required packages..."
 echo ""
 
 # Core packages — always required
-CORE_DEPS=(rsync gdisk dosfstools e2fsprogs grub-efi-amd64 util-linux)
+CORE_DEPS=(rsync gdisk dosfstools e2fsprogs grub-efi-amd64 util-linux parted)
 
 # Encryption packages — required for LUKS+LVM systems
 LUKS_DEPS=(cryptsetup lvm2)
