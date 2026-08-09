@@ -1,0 +1,224 @@
+#!/bin/bash
+# image-info — x86_64 Ubuntu 24.04 / Debian 13
+# Display partition layout, UUIDs, LUKS info, and GRUB config of a .img file.
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+# Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
+
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/img-info-mnt"
+LOOP="" MNTED=FALSE
+IMG_LUKS_MAPPER="" IMG_VG_NAME="" IMG_LV_PATH=""
+
+errexit()
+{
+  echo ""; echo -e "$1"; echo ""
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/boot/efi" &> /dev/null
+    umount "${MNTPATH}/boot"     &> /dev/null
+    umount "${MNTPATH}/"         &> /dev/null
+    MNTED=FALSE
+  fi
+  [ -n "${IMG_VG_NAME}" ] && vgchange -an "${IMG_VG_NAME}" &> /dev/null
+  [ -n "${IMG_LUKS_MAPPER}" ] && cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  [ -n "${LOOP}" ] && losetup -d "${LOOP}" &> /dev/null
+  rm -rf "${MNTPATH}/" &> /dev/null
+  exit 1
+}
+
+[ "$(id -u)" -ne 0 ] && errexit "$0 must be run as root user"
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+IMGFILE="" PASSPHRASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--passphrase) PASSPHRASE="$2"; shift 2 ;;
+    -h|--help)       errexit "Usage: $0 [-p passphrase] pathto/imagefile" ;;
+    -*)              errexit "Usage: $0 [-p passphrase] pathto/imagefile" ;;
+    *)               IMGFILE="$1"; shift ;;
+  esac
+done
+
+# Interactive prompt if no file given
+while :; do
+  if [ -z "${IMGFILE}" ]; then
+    echo ""
+    read -r -e -p "Image file name? " IMGFILE
+    [ -z "${IMGFILE}" ] && continue
+    [ -d "${IMGFILE}" ] && { echo ""; echo "${IMGFILE} is a directory"; IMGFILE=""; continue; }
+  fi
+  [ -f "${IMGFILE}" ] && break
+  echo ""; echo "${IMGFILE} not found"
+  IMGFILE=""
+done
+
+LOOP="$(losetup -f --show -P "${IMGFILE}")"
+[ $? -ne 0 ] && errexit "Unable to create loop device"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
+
+NUM_PARTS="$(count_parts "${IMGFILE}")"
+THREE_PART=FALSE; ROOT_PART_NUM=2
+[ "${NUM_PARTS}" -ge 3 ] && { THREE_PART=TRUE; ROOT_PART_NUM=3; }
+
+FS_TYPE_ROOT="$(blkid "${LOOP}p${ROOT_PART_NUM}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+ENCRYPTED=FALSE
+if [ "${FS_TYPE_ROOT}" = "crypto_LUKS" ]; then
+  ENCRYPTED=TRUE
+  command -v cryptsetup &> /dev/null || apt-get install -y cryptsetup &> /dev/null
+  if [ -z "${PASSPHRASE}" ]; then
+    echo -n "Enter LUKS passphrase (or press Enter to skip decrypted info): "
+    read -rs PASSPHRASE; echo ""
+  fi
+  if [ -n "${PASSPHRASE}" ]; then
+    IMG_LUKS_MAPPER="info$(date +%s)"
+    echo -n "${PASSPHRASE}" | \
+      cryptsetup luksOpen "${LOOP}p${ROOT_PART_NUM}" "${IMG_LUKS_MAPPER}" --key-file=-
+    if [ $? -eq 0 ]; then
+      LVM_TYPE="$(blkid "/dev/mapper/${IMG_LUKS_MAPPER}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+      if [ "${LVM_TYPE}" = "LVM2_member" ]; then
+        command -v vgchange &> /dev/null || apt-get install -y lvm2 &> /dev/null
+        IMG_VG_NAME="$(pvs --noheadings -o vg_name "/dev/mapper/${IMG_LUKS_MAPPER}" \
+                       2>/dev/null | tr -d ' ')"
+        vgchange -ay "${IMG_VG_NAME}" &> /dev/null
+        IMG_LV_NAME="$(lvs --noheadings -o lv_name "${IMG_VG_NAME}" 2>/dev/null | tr -d ' ' | head -1)"
+        IMG_LV_PATH="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
+      else
+        IMG_LV_PATH="/dev/mapper/${IMG_LUKS_MAPPER}"
+      fi
+    else
+      echo "  WARNING: Could not open LUKS — decrypted filesystem info unavailable."
+      PASSPHRASE=""
+    fi
+  fi
+fi
+
+# Mount for info gathering
+mkdir -p "${MNTPATH}/"
+if [ "${ENCRYPTED}" = "TRUE" ] && [ -n "${PASSPHRASE}" ]; then
+  mount "${IMG_LV_PATH}" "${MNTPATH}/" || errexit "Unable to mount root LV"
+else
+  if [ "${ENCRYPTED}" = "FALSE" ]; then
+    mount "${LOOP}p${ROOT_PART_NUM}" "${MNTPATH}/" || errexit "Unable to mount ROOT"
+  fi
+fi
+
+if [ "${ENCRYPTED}" = "FALSE" ] || [ -n "${PASSPHRASE}" ]; then
+  MNTED=TRUE
+  [ "${THREE_PART}" = "TRUE" ] && { mkdir -p "${MNTPATH}/boot/"; mount "${LOOP}p2" "${MNTPATH}/boot/" || true; }
+  mkdir -p "${MNTPATH}/boot/efi/"
+  mount "${LOOP}p1" "${MNTPATH}/boot/efi/" || true
+fi
+
+# ---- Print info ----
+echo ""
+echo "===== Image File ====="
+ls -lh "${IMGFILE}"
+
+echo ""
+echo "===== Partition Table ====="
+sfdisk -d "${IMGFILE}" 2>/dev/null
+
+echo ""
+echo "===== Block IDs ====="
+echo "  disk : $(blkid "${LOOP}")"
+echo "  EFI  : $(blkid "${LOOP}p1")"
+[ "${THREE_PART}" = "TRUE" ] && echo "  boot : $(blkid "${LOOP}p2")"
+echo "  root : $(blkid "${LOOP}p${ROOT_PART_NUM}")"
+
+if [ "${ENCRYPTED}" = "TRUE" ]; then
+  echo ""
+  echo "===== LUKS Info ====="
+  cryptsetup luksDump "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null | grep -E 'Version|Cipher|UUID|Keyslot'
+  if [ -n "${IMG_VG_NAME}" ]; then
+    echo ""
+    echo "===== LVM Info ====="
+    pvs "/dev/mapper/${IMG_LUKS_MAPPER}" 2>/dev/null
+    vgs "${IMG_VG_NAME}" 2>/dev/null
+    lvs "${IMG_VG_NAME}" 2>/dev/null
+  fi
+fi
+
+if [ "${MNTED}" = "TRUE" ]; then
+  echo ""
+  echo "===== Filesystem Sizes ====="
+  df -Th "${MNTPATH}/" 2>/dev/null
+  [ "${THREE_PART}" = "TRUE" ] && df -Th "${MNTPATH}/boot/" 2>/dev/null
+  df -Th "${MNTPATH}/boot/efi/" 2>/dev/null
+
+  echo ""
+  echo "===== /etc/fstab in image ====="
+  cat "${MNTPATH}/etc/fstab" 2>/dev/null || echo "(not found)"
+
+  if [ "${ENCRYPTED}" = "TRUE" ]; then
+    echo ""
+    echo "===== /etc/crypttab in image ====="
+    cat "${MNTPATH}/etc/crypttab" 2>/dev/null || echo "(not found)"
+  fi
+
+  echo ""
+  echo "===== GRUB config (first 40 lines) ====="
+  if [ -f "${MNTPATH}/boot/grub/grub.cfg" ]; then
+    head -40 "${MNTPATH}/boot/grub/grub.cfg"
+  else
+    echo "(no grub.cfg found)"
+  fi
+fi
+
+# Cleanup
+umount "${MNTPATH}/boot/efi" &> /dev/null
+[ "${THREE_PART}" = "TRUE" ] && umount "${MNTPATH}/boot" &> /dev/null
+[ "${MNTED}" = "TRUE" ] && umount "${MNTPATH}/" &> /dev/null
+MNTED=FALSE
+[ -n "${IMG_VG_NAME}" ] && vgchange -an "${IMG_VG_NAME}" &> /dev/null
+[ -n "${IMG_LUKS_MAPPER}" ] && cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+losetup -d "${LOOP}" &> /dev/null
+rm -rf "${MNTPATH}/"
+
+echo ""

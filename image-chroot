@@ -1,0 +1,214 @@
+#!/bin/bash
+# image-chroot — x86_64 Ubuntu 24.04 / Debian 13
+# chroot into a .img file (plain ext4 or LUKS+LVM) for inspection or repair.
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+# Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
+
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/image-chroot-mnt"
+LOOP=""
+MNTED=FALSE
+IMG_LUKS_MAPPER=""
+IMG_VG_NAME=""
+IMG_LV_PATH=""
+ENCRYPTED=FALSE
+
+errexit()
+{
+  echo ""; echo -e "$1"; echo ""
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/dev/pts" &> /dev/null
+    umount "${MNTPATH}/dev"     &> /dev/null
+    umount "${MNTPATH}/sys"     &> /dev/null
+    umount "${MNTPATH}/proc"    &> /dev/null
+    umount "${MNTPATH}/run"     &> /dev/null
+    umount "${MNTPATH}/boot/efi" &> /dev/null
+    umount "${MNTPATH}/boot"    &> /dev/null
+    umount "${MNTPATH}"         &> /dev/null
+    MNTED=FALSE
+  fi
+  _close_luks
+  [ -n "${LOOP}" ] && losetup -d "${LOOP}" &> /dev/null
+  rm -rf "${MNTPATH}/" &> /dev/null
+  exit 1
+}
+
+_close_luks()
+{
+  [ -n "${IMG_VG_NAME}" ] && vgchange -an "${IMG_VG_NAME}" &> /dev/null
+  [ -n "${IMG_LUKS_MAPPER}" ] && cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+}
+
+usage() { errexit "Usage: $0 [-p passphrase] pathto/imagefile"; }
+
+[ "$(id -u)" -ne 0 ] && errexit "Must be run as root: sudo $0"
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+IMGFILE="" PASSPHRASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--passphrase) PASSPHRASE="$2"; shift 2 ;;
+    -h|--help)       usage ;;
+    -*) usage ;;
+    *)  IMGFILE="$1"; shift ;;
+  esac
+done
+[ -z "${IMGFILE}" ] && usage
+[ ! -f "${IMGFILE}" ] && errexit "${IMGFILE} not found"
+
+# Detect image layout
+LOOP="$(losetup -f --show -P "${IMGFILE}")"
+[ $? -ne 0 ] && errexit "Unable to create loop device"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
+NUM_PARTS="$(count_parts "${IMGFILE}")"
+ROOT_PART_NUM="${NUM_PARTS}"
+
+THREE_PART=FALSE
+[ "${NUM_PARTS}" -ge 3 ] && THREE_PART=TRUE
+
+FS_TYPE_RAW="$(blkid "${LOOP}p${ROOT_PART_NUM}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+if [ "${FS_TYPE_RAW}" = "crypto_LUKS" ]; then
+  ENCRYPTED=TRUE
+  command -v cryptsetup &> /dev/null || apt-get install -y cryptsetup &> /dev/null
+  if [ -z "${PASSPHRASE}" ]; then
+    echo -n "Enter LUKS passphrase for image: "
+    read -rs PASSPHRASE; echo ""
+  fi
+  IMG_LUKS_MAPPER="chroot$(date +%s)"
+  echo -n "${PASSPHRASE}" | \
+    cryptsetup luksOpen "${LOOP}p${ROOT_PART_NUM}" "${IMG_LUKS_MAPPER}" --key-file=-
+  [ $? -ne 0 ] && { losetup -d "${LOOP}"; errexit "Failed to open LUKS container"; }
+
+  LVM_TYPE="$(blkid "/dev/mapper/${IMG_LUKS_MAPPER}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+  if [ "${LVM_TYPE}" = "LVM2_member" ]; then
+    command -v vgchange &> /dev/null || apt-get install -y lvm2 &> /dev/null
+    IMG_VG_NAME="$(pvs --noheadings -o vg_name "/dev/mapper/${IMG_LUKS_MAPPER}" \
+                   2>/dev/null | tr -d ' ')"
+    vgchange -ay "${IMG_VG_NAME}" &> /dev/null
+    IMG_LV_NAME="$(lvs --noheadings -o lv_name "${IMG_VG_NAME}" 2>/dev/null | tr -d ' ' | head -1)"
+    IMG_LV_PATH="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
+  else
+    IMG_LV_PATH="/dev/mapper/${IMG_LUKS_MAPPER}"
+  fi
+fi
+losetup -d "${LOOP}"
+
+echo ""
+echo -n "chroot to ${IMGFILE} (y/n)? "
+while read -r -n 1 -s a; do
+  if [[ "${a}" = [yYnN] ]]; then
+    echo "${a}"
+    [[ "${a}" = [yY] ]] && break || errexit "Aborted"
+  fi
+done
+echo ""
+echo "Chrooting into ${IMGFILE}"
+echo "Host root is available at /host-root-fs"
+echo "Type 'exit' or Ctrl+D to leave"
+echo ""
+
+# Re-open loop for mounting
+LOOP="$(losetup -f --show -P "${IMGFILE}")"
+[ $? -ne 0 ] && { _close_luks; errexit "Unable to re-open loop device"; }
+
+mkdir -p "${MNTPATH}/"
+
+if [ "${ENCRYPTED}" = "TRUE" ]; then
+  echo -n "${PASSPHRASE}" | \
+    cryptsetup luksOpen "${LOOP}p${ROOT_PART_NUM}" "${IMG_LUKS_MAPPER}" --key-file=-
+  [ -n "${IMG_VG_NAME}" ] && vgchange -ay "${IMG_VG_NAME}" &> /dev/null
+  mount "${IMG_LV_PATH}" "${MNTPATH}/" || errexit "Unable to mount root LV"
+else
+  mount "${LOOP}p${ROOT_PART_NUM}" "${MNTPATH}/" || errexit "Unable to mount ROOT"
+fi
+MNTED=TRUE
+
+[ "${THREE_PART}" = "TRUE" ] && { mkdir -p "${MNTPATH}/boot/"; mount "${LOOP}p2" "${MNTPATH}/boot/" || errexit "Cannot mount /boot"; }
+mkdir -p "${MNTPATH}/boot/efi/"
+mount "${LOOP}p1" "${MNTPATH}/boot/efi/" || errexit "Cannot mount EFI"
+
+mkdir -p "${MNTPATH}/host-root-fs"
+mount --bind /        "${MNTPATH}/host-root-fs"
+mount --bind /dev     "${MNTPATH}/dev"
+mount --bind /dev/pts "${MNTPATH}/dev/pts"
+mount --bind /sys     "${MNTPATH}/sys"
+mount -t proc proc    "${MNTPATH}/proc"
+mount --bind /run     "${MNTPATH}/run"
+
+chroot "${MNTPATH}"
+
+umount "${MNTPATH}/dev/pts"  &> /dev/null
+umount "${MNTPATH}/proc"     &> /dev/null
+umount "${MNTPATH}/sys"      &> /dev/null
+umount "${MNTPATH}/dev"      &> /dev/null
+umount "${MNTPATH}/run"      &> /dev/null
+
+while read MNTPT; do
+  [[ "${MNTPT}" != "${MNTPATH}/boot/efi" && "${MNTPT}" != "${MNTPATH}/boot" && \
+     "${MNTPT}" != "${MNTPATH}" && "${MNTPT}" != "${MNTPATH}/host-root-fs" ]] && \
+    umount "${MNTPT}" &> /dev/null
+done <<< "$(findmnt -lR "${MNTPATH}" | sed -n "s|^\(${MNTPATH}/\S\+\)\s.*|\1|p")"
+
+umount "${MNTPATH}/host-root-fs" &> /dev/null
+rmdir  "${MNTPATH}/host-root-fs" &> /dev/null
+umount "${MNTPATH}/boot/efi"     &> /dev/null
+[ "${THREE_PART}" = "TRUE" ] && umount "${MNTPATH}/boot" &> /dev/null
+umount "${MNTPATH}/"             &> /dev/null
+MNTED=FALSE
+
+_close_luks
+losetup -d "${LOOP}" &> /dev/null
+LOOP=""
+rm -rf "${MNTPATH}/"
+
+echo ""
+echo "Exited chroot from ${IMGFILE}"
+echo ""

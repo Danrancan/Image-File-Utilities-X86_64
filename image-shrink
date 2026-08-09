@@ -1,0 +1,324 @@
+#!/bin/bash
+# image-shrink — x86_64 Ubuntu 24.04 / Debian 13
+# Shrinks the root filesystem of a .img file to minimum possible size.
+# Supports: plain ext4, LUKS+LVM ext4, LUKS-direct ext4.
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+# Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
+
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
+ONEMB=$((1024 * 1024))
+LOOP=""
+IMG_LUKS_MAPPER=""
+IMG_VG_NAME=""
+IMG_LV_NAME=""
+IMG_MAPPER_OPEN=FALSE
+
+errexit()
+{
+  echo ""
+  echo "$1"
+  echo ""
+  # Best-effort cleanup
+  _deactivate_lvm
+  [ -n "${IMG_LUKS_MAPPER}" ] && cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  rmloop
+  exit 1
+}
+
+mkloop()
+{
+  LOOP="$(losetup -f --show -P "${IMGFILE}")"
+  [ $? -ne 0 ] && errexit "Unable to create loop device"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
+}
+
+rmloop()
+{
+  [ -n "${LOOP}" ] && { losetup -d "${LOOP}" &> /dev/null; LOOP=""; }
+}
+
+fsckerr()
+{
+  _deactivate_lvm
+  cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  rmloop
+  errexit "Filesystem appears corrupted ($1 resize2fs)"
+}
+
+_deactivate_lvm()
+{
+  [ -n "${IMG_VG_NAME}" ] && vgchange -an "${IMG_VG_NAME}" &> /dev/null
+}
+
+_rebuild_gpt()
+{
+  local ROOT_START="$1" PART_TYPE="$2" PART_LABEL="$3"
+  sgdisk -e "${IMGFILE}" &> /dev/null
+  sgdisk -d "${ROOT_PART_NUM}" "${IMGFILE}" &> /dev/null
+  sgdisk -n "${ROOT_PART_NUM}:${ROOT_START}:0" \
+         -t "${ROOT_PART_NUM}:${PART_TYPE}" \
+         -c "${ROOT_PART_NUM}:${PART_LABEL}" \
+         "${IMGFILE}" &> /dev/null
+}
+
+# =============================================================================
+
+if [ "$(id -u)" -ne 0 ]; then
+  errexit "$0 must be run as root user"
+fi
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+for DEP in sgdisk sfdisk resize2fs e2fsck tune2fs; do
+  command -v "${DEP}" &> /dev/null || {
+    echo ""
+    echo "${DEP} not found."
+    echo -n "Ok to install? (y/n)? "
+    while read -r -n 1 -s a; do
+      if [[ "${a}" = [yYnN] ]]; then
+        echo "${a}"; [[ "${a}" = [yY] ]] && break || errexit "Aborted"
+      fi
+    done
+    apt-get update -qq
+    case "${DEP}" in
+      sgdisk)                   apt-get install -y gdisk ;;
+      resize2fs|e2fsck|tune2fs) apt-get install -y e2fsprogs ;;
+      *)                        apt-get install -y "${DEP}" ;;
+    esac
+  }
+done
+
+IMGFILE="$1"
+[ -z "${IMGFILE}" ] && errexit "Usage: $0 imagefile [Additional MB] [-p passphrase]"
+[ ! -f "${IMGFILE}" ] || [ ! -s "${IMGFILE}" ] && errexit "${IMGFILE} is missing or empty"
+
+# Additional MB padding (optional second argument)
+ADDMB="${2:-}"
+PASSPHRASE="${3:-}"   # -p passphrase can also be passed as 3rd arg
+
+# Parse -p flag anywhere in args
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--passphrase) PASSPHRASE="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# Detect image layout
+mkloop
+NUM_PARTS="$(count_parts "${IMGFILE}")"
+ROOT_PART_NUM="${NUM_PARTS}"
+FS_TYPE_RAW="$(blkid "${LOOP}p${ROOT_PART_NUM}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+rmloop
+
+# Detect if encrypted
+ENCRYPTED=FALSE
+LUKS_LVM=FALSE
+if [ "${FS_TYPE_RAW}" = "crypto_LUKS" ]; then
+  ENCRYPTED=TRUE
+  command -v cryptsetup &> /dev/null || {
+    apt-get update -qq && apt-get install -y cryptsetup
+  }
+  # Check for LVM inside by peeking after open
+fi
+
+if [ "${FS_TYPE_RAW}" = "f2fs" ]; then
+  errexit "Cannot shrink F2FS filesystem"
+fi
+
+# Ask for additional MB padding if not provided
+if [[ ! "${ADDMB}" =~ ^[0-9]+$ ]]; then
+  echo ""
+  while :; do
+    read -r -e -i "${ADDMB}" -p "Additional MB padding after shrink [0]? " ADDMB
+    [[ "${ADDMB}" =~ ^[0-9]*$ ]] && break
+  done
+fi
+while [ "${ADDMB:0:1}" = "0" ]; do ADDMB="${ADDMB:1}"; done
+[ -z "${ADDMB}" ] && ADDMB=0
+
+echo ""
+echo -n "Shrink ${IMGFILE} [Additional MB = ${ADDMB}] (y/n)? "
+while read -r -n 1 -s a; do
+  if [[ "${a}" = [yYnN] ]]; then
+    echo "${a}"
+    [[ "${a}" = [yY] ]] && break || errexit "Aborted"
+  fi
+done
+echo ""
+
+PTTYPE="$(sfdisk -d "${IMGFILE}" | sed -n 's|^label: \(\S\+\).*|\1|p')"
+[ "${PTTYPE}" != "gpt" ] && [ "${PTTYPE}" != "dos" ] && \
+  errexit "Unsupported partition table type: ${PTTYPE}"
+
+ROOT_START="$(part_start "${IMGFILE}" "${ROOT_PART_NUM}")"
+if ! [[ "${ROOT_START}" =~ ^[0-9]+$ ]] || [ "${ROOT_START}" -lt 2048 ]; then
+  errexit "Could not read partition ${ROOT_PART_NUM} start sector from ${IMGFILE}.\nAborting before truncate to avoid corrupting the image."
+fi
+
+# =============================================================================
+# PLAIN EXT4
+# =============================================================================
+if [ "${ENCRYPTED}" = "FALSE" ]; then
+  mkloop
+  e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "before"
+  echo ""
+  resize2fs -f -M "${LOOP}p${ROOT_PART_NUM}"
+  resize2fs -f -M "${LOOP}p${ROOT_PART_NUM}"
+  resize2fs -f -M "${LOOP}p${ROOT_PART_NUM}"
+  e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "after"
+
+  INFO="$(tune2fs -l "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
+  NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
+  NEWEND=$(( ROOT_START + (NEWSIZE * (BLKSIZE / 512)) + ((ADDMB * ONEMB) / 512) - 1 + 33 ))
+  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+  _rebuild_gpt "${ROOT_START}" "8300" "Linux root"
+
+  if [ "${ADDMB}" -ne 0 ]; then
+    e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "before expand"
+    resize2fs -f "${LOOP}p${ROOT_PART_NUM}"
+    e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "after expand"
+  fi
+  rmloop
+
+# =============================================================================
+# LUKS (with or without LVM)
+# =============================================================================
+else
+  # Get/prompt for passphrase
+  if [ -z "${PASSPHRASE}" ]; then
+    echo -n "Enter LUKS passphrase for image: "
+    read -rs PASSPHRASE; echo ""
+  fi
+
+  mkloop
+  IMG_LUKS_MAPPER="shrink$(date +%s)"
+  echo -n "${PASSPHRASE}" | \
+    cryptsetup luksOpen "${LOOP}p${ROOT_PART_NUM}" "${IMG_LUKS_MAPPER}" --key-file=-
+  [ $? -ne 0 ] && { rmloop; errexit "Failed to open LUKS container — wrong passphrase?"; }
+  IMG_MAPPER_OPEN=TRUE
+
+  # Check for LVM
+  local_fs_type="$(blkid "/dev/mapper/${IMG_LUKS_MAPPER}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+  if [ "${local_fs_type}" = "LVM2_member" ]; then
+    LUKS_LVM=TRUE
+    command -v lvreduce &> /dev/null || apt-get install -y lvm2
+    IMG_VG_NAME="$(pvs --noheadings -o vg_name "/dev/mapper/${IMG_LUKS_MAPPER}" \
+                   2>/dev/null | tr -d ' ')"
+    vgchange -ay "${IMG_VG_NAME}" &> /dev/null
+    IMG_LV_NAME="$(lvs --noheadings -o lv_name "${IMG_VG_NAME}" 2>/dev/null | tr -d ' ' | head -1)"
+    LV_DEV="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
+
+    echo "Phase 1: Shrink ext4 on LV ${LV_DEV}..."
+    e2fsck -f -n "${LV_DEV}" || fsckerr "before"
+    echo ""
+    resize2fs -f -M "${LV_DEV}"
+    resize2fs -f -M "${LV_DEV}"
+    resize2fs -f -M "${LV_DEV}"
+    e2fsck -f -n "${LV_DEV}" || fsckerr "after"
+
+    INFO="$(tune2fs -l "${LV_DEV}" 2>/dev/null)"
+    NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
+    BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
+    NEW_LV_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
+
+    echo "Phase 2: Reduce LV..."
+    lvreduce --force -L "${NEW_LV_BYTES}B" "${IMG_VG_NAME}/${IMG_LV_NAME}" &> /dev/null
+
+    echo "Phase 3: Resize LVM PV..."
+    NEW_PV_BYTES=$(( NEW_LV_BYTES + (32 * ONEMB) ))
+    pvresize --setphysicalvolumesize "${NEW_PV_BYTES}B" \
+      "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null
+
+    echo "Phase 4: Resize LUKS data area..."
+    NEW_LUKS_SECTORS=$(( (NEW_PV_BYTES + (4 * ONEMB)) / 512 ))
+    cryptsetup resize --size "${NEW_LUKS_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+
+    echo "Phase 5: Close LUKS..."
+    _deactivate_lvm
+    cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+    IMG_MAPPER_OPEN=FALSE
+
+    echo "Phase 6: Truncate image and fix GPT..."
+    NEWEND=$(( ROOT_START + NEW_LUKS_SECTORS + 33 ))
+    truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+    _rebuild_gpt "${ROOT_START}" "8309" "Linux LUKS"
+
+  else
+    # LUKS direct (no LVM)
+    CDEV="/dev/mapper/${IMG_LUKS_MAPPER}"
+    e2fsck -f -n "${CDEV}" || fsckerr "before"
+    echo ""
+    resize2fs -f -M "${CDEV}"
+    resize2fs -f -M "${CDEV}"
+    resize2fs -f -M "${CDEV}"
+    e2fsck -f -n "${CDEV}" || fsckerr "after"
+
+    INFO="$(tune2fs -l "${CDEV}" 2>/dev/null)"
+    NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
+    BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
+    NEW_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
+    NEW_SECTORS=$(( NEW_BYTES / 512 ))
+
+    cryptsetup resize --size "${NEW_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+    cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+    IMG_MAPPER_OPEN=FALSE
+
+    NEWEND=$(( ROOT_START + NEW_SECTORS + 33 ))
+    truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+    _rebuild_gpt "${ROOT_START}" "8309" "Linux LUKS"
+  fi
+
+  rmloop
+fi
+
+echo ""
+echo "Shrink complete."
+echo "Image size on disk: $(du -h "${IMGFILE}" | cut -f1)"
+echo ""

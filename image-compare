@@ -1,0 +1,194 @@
+#!/bin/bash
+# image-compare — x86_64 Ubuntu 24.04 / Debian 13
+# Dry-run rsync diff: live system vs .img backup (plain or LUKS+LVM).
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+# Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
+
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/img-compare-mnt"
+LOOP="" MNTED=FALSE
+IMG_LUKS_MAPPER="" IMG_VG_NAME="" IMG_LV_PATH=""
+
+errexit()
+{
+  echo ""; echo -e "$1"; echo ""
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/boot/efi" &> /dev/null
+    umount "${MNTPATH}/boot"     &> /dev/null
+    umount "${MNTPATH}/"         &> /dev/null
+    MNTED=FALSE
+  fi
+  [ -n "${IMG_VG_NAME}" ] && vgchange -an "${IMG_VG_NAME}" &> /dev/null
+  [ -n "${IMG_LUKS_MAPPER}" ] && cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  [ -n "${LOOP}" ] && losetup -d "${LOOP}" &> /dev/null
+  rm -rf "${MNTPATH}/" &> /dev/null
+  exit 1
+}
+
+usage()
+{
+  errexit "Usage: $0 [-p passphrase] [-o rsync_options] pathto/imagefile"
+}
+
+[ "$(id -u)" -ne 0 ] && errexit "$0 must be run as root user"
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+command -v rsync &> /dev/null || errexit "rsync not installed (apt-get install rsync)"
+
+IMGFILE="" PASSPHRASE="" OPTIONS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--passphrase) PASSPHRASE="$2"; shift 2 ;;
+    -o|--options)
+      OIFS=${IFS}; IFS=','
+      OPTIONS+=($2); IFS=${OIFS}
+      shift 2 ;;
+    -u|--ubuntu) shift ;;
+    -h|--help)   usage ;;
+    -*)          usage ;;
+    *)           IMGFILE="$1"; shift ;;
+  esac
+done
+
+while :; do
+  if [ -z "${IMGFILE}" ]; then
+    echo ""
+    read -r -e -p "Image file to compare? " IMGFILE
+    [ -z "${IMGFILE}" ] && continue
+    [ -d "${IMGFILE}" ] && { echo ""; echo "${IMGFILE} is a directory"; IMGFILE=""; continue; }
+  fi
+  [ -f "${IMGFILE}" ] && break
+  echo ""; echo "${IMGFILE} not found"; IMGFILE=""
+done
+
+LOOP="$(losetup -f --show -P "${IMGFILE}")"
+[ $? -ne 0 ] && errexit "Unable to create loop device"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
+
+NUM_PARTS="$(count_parts "${IMGFILE}")"
+THREE_PART=FALSE; ROOT_PART_NUM=2
+[ "${NUM_PARTS}" -ge 3 ] && { THREE_PART=TRUE; ROOT_PART_NUM=3; }
+
+FS_TYPE_ROOT="$(blkid "${LOOP}p${ROOT_PART_NUM}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+ENCRYPTED=FALSE
+
+if [ "${FS_TYPE_ROOT}" = "crypto_LUKS" ]; then
+  ENCRYPTED=TRUE
+  command -v cryptsetup &> /dev/null || apt-get install -y cryptsetup &> /dev/null
+  if [ -z "${PASSPHRASE}" ]; then
+    echo -n "Enter LUKS passphrase: "
+    read -rs PASSPHRASE; echo ""
+  fi
+  IMG_LUKS_MAPPER="cmp$(date +%s)"
+  echo -n "${PASSPHRASE}" | \
+    cryptsetup luksOpen "${LOOP}p${ROOT_PART_NUM}" "${IMG_LUKS_MAPPER}" --key-file=-
+  [ $? -ne 0 ] && { losetup -d "${LOOP}"; errexit "Failed to open LUKS container"; }
+
+  LVM_TYPE="$(blkid "/dev/mapper/${IMG_LUKS_MAPPER}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+  if [ "${LVM_TYPE}" = "LVM2_member" ]; then
+    command -v vgchange &> /dev/null || apt-get install -y lvm2 &> /dev/null
+    IMG_VG_NAME="$(pvs --noheadings -o vg_name "/dev/mapper/${IMG_LUKS_MAPPER}" \
+                   2>/dev/null | tr -d ' ')"
+    vgchange -ay "${IMG_VG_NAME}" &> /dev/null
+    IMG_LV_NAME="$(lvs --noheadings -o lv_name "${IMG_VG_NAME}" 2>/dev/null | tr -d ' ' | head -1)"
+    IMG_LV_PATH="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
+  else
+    IMG_LV_PATH="/dev/mapper/${IMG_LUKS_MAPPER}"
+  fi
+fi
+
+mkdir -p "${MNTPATH}/"
+if [ "${ENCRYPTED}" = "TRUE" ]; then
+  mount "${IMG_LV_PATH}" "${MNTPATH}/" || errexit "Unable to mount root LV"
+else
+  mount "${LOOP}p${ROOT_PART_NUM}" "${MNTPATH}/" || errexit "Unable to mount ROOT"
+fi
+MNTED=TRUE
+[ "${THREE_PART}" = "TRUE" ] && { mkdir -p "${MNTPATH}/boot/"; mount "${LOOP}p2" "${MNTPATH}/boot/" || true; }
+mkdir -p "${MNTPATH}/boot/efi/"
+mount "${LOOP}p1" "${MNTPATH}/boot/efi/" || true
+
+sync
+echo ""
+echo "Comparing live system to ${IMGFILE}..."
+echo "(Items prefixed with '<' differ from or are missing in the image)"
+echo ""
+
+rsync -aHDx --dry-run --itemize-changes --partial --numeric-ids --delete --force \
+  --exclude="${MNTPATH}" \
+  --exclude='/dev' \
+  --exclude='/lost+found' \
+  --exclude='/media' \
+  --exclude='/mnt' \
+  --exclude='/proc' \
+  --exclude='/run' \
+  --exclude='/sys' \
+  --exclude='/tmp' \
+  --exclude='/var/swap' \
+  --exclude='/var/cache/apt/archives' \
+  --exclude='/etc/udev/rules.d/70-persistent-net.rules' \
+  --exclude='/var/lib/asterisk/astdb.sqlite3-journal' \
+  "${OPTIONS[@]}" \
+  / "${MNTPATH}/"
+RC=$?
+
+echo ""
+sync
+umount "${MNTPATH}/boot/efi" &> /dev/null
+[ "${THREE_PART}" = "TRUE" ] && umount "${MNTPATH}/boot" &> /dev/null
+umount "${MNTPATH}/" &> /dev/null
+MNTED=FALSE
+[ -n "${IMG_VG_NAME}" ] && vgchange -an "${IMG_VG_NAME}" &> /dev/null
+[ -n "${IMG_LUKS_MAPPER}" ] && cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+losetup -d "${LOOP}" &> /dev/null
+rm -rf "${MNTPATH}/"
+
+[ "${RC}" -ne 0 ] && errexit "rsync comparison failed (exit code: ${RC})"

@@ -1,0 +1,166 @@
+#!/bin/bash
+# image-check — x86_64 Ubuntu 24.04 / Debian 13
+# Check filesystem integrity of a .img file (plain or LUKS+LVM).
+#
+# Based on RonR's Image File Utilities for Raspberry Pi
+# Adapted: https://github.com/Danrancan/Image-File-Utilities-X86_64
+
+
+# Wait for udev to create partition device nodes on a loop device.
+# Without this, e2fsck/mount can fire before ${LOOP}pN exists.
+loop_settle()
+{
+  local DEV="$1"
+  udevadm settle 2>/dev/null
+  local TRIES=0
+  while [ ! -e "${DEV}p1" ] && [ ${TRIES} -lt 40 ]; do
+    sleep 0.25
+    partprobe "${DEV}" 2>/dev/null
+    udevadm settle 2>/dev/null
+    TRIES=$((TRIES + 1))
+  done
+  if [ ! -e "${DEV}p1" ]; then
+    echo "" >&2
+    echo "ERROR: partition devices for ${DEV} never appeared." >&2
+    echo "Try: sudo partprobe ${DEV}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Count partitions in an image file via its GPT/MBR table.
+# NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
+# ("loop48") itself contains "p4" and gets counted as a partition.
+count_parts()
+{
+  local IMG="$1"
+  sfdisk -d "${IMG}" 2>/dev/null | grep -c ': start='
+}
+
+# Get the first sector of partition N in an image file.
+# sgdisk -i is used because sfdisk -d writes "<file>N : start=" with no
+# whitespace before N, which defeated the previous grep pattern.
+part_start()
+{
+  local IMG="$1" N="$2"
+  sgdisk -i "${N}" "${IMG}" 2>/dev/null \
+    | sed -n 's|^First sector: \([0-9]*\).*|\1|p'
+}
+
+errexit()
+{
+  echo ""; echo "$1"; echo ""
+  exit 1
+}
+
+usage()
+{
+  errexit "Usage: $0 [-p passphrase] imagefile [EFI|Boot|Linux]
+  EFI   — check EFI/vfat partition
+  Boot  — check /boot/ext4 partition (3-part images)
+  Linux — check root partition (default)"
+}
+
+[ "$(id -u)" -ne 0 ] && errexit "$0 must be run as root user"
+
+PGMNAME="$(basename "$0")"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  [ "${PID}" -ne $$ ] && errexit "${PGMNAME} is already running"
+done
+
+IMGFILE="" PART="" PASSPHRASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--passphrase) PASSPHRASE="$2"; shift 2 ;;
+    -h|--help)       usage ;;
+    -*)              usage ;;
+    *)
+      if   [ -z "${IMGFILE}" ]; then IMGFILE="$1"
+      elif [ -z "${PART}" ];    then PART="$1"
+      fi
+      shift ;;
+  esac
+done
+
+[ -z "${IMGFILE}" ] && usage
+[ ! -f "${IMGFILE}" ] && errexit "${IMGFILE} not found"
+
+LOOP="$(losetup -f --show -P "${IMGFILE}")"
+[ $? -ne 0 ] && errexit "Unable to create loop device"
+  loop_settle "${LOOP}" || errexit "Loop partition devices did not appear"
+NUM_PARTS="$(count_parts "${IMGFILE}")"
+
+PART="$(tr '[:upper:]' '[:lower:]' <<< "${PART:-linux}")"
+case "${PART}" in
+  efi)        PARTNUM=1 ;;
+  boot)
+    [ "${NUM_PARTS}" -lt 3 ] && { losetup -d "${LOOP}"; errexit "No separate /boot in this image"; }
+    PARTNUM=2 ;;
+  linux|root) PARTNUM="${NUM_PARTS}" ;;
+  *)          losetup -d "${LOOP}"; usage ;;
+esac
+
+echo ""
+echo -n "Check ${IMGFILE} partition ${PARTNUM} (y/n)? "
+while read -r -n 1 -s a; do
+  if [[ "${a}" = [yYnN] ]]; then
+    echo "${a}"
+    if [[ "${a}" = [yY] ]]; then break; else losetup -d "${LOOP}"; errexit "Aborted"; fi
+  fi
+done
+echo ""
+
+FS_TYPE="$(blkid "${LOOP}p${PARTNUM}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+RC=0
+
+if [ "${FS_TYPE}" = "crypto_LUKS" ]; then
+  command -v cryptsetup &> /dev/null || apt-get install -y cryptsetup &> /dev/null
+  if [ -z "${PASSPHRASE}" ]; then
+    echo -n "Enter LUKS passphrase: "
+    read -rs PASSPHRASE; echo ""
+  fi
+  MAPPER="check$(date +%s)"
+  echo -n "${PASSPHRASE}" | cryptsetup luksOpen "${LOOP}p${PARTNUM}" "${MAPPER}" --key-file=-
+  [ $? -ne 0 ] && { losetup -d "${LOOP}"; errexit "Failed to open LUKS container"; }
+
+  LVM_TYPE="$(blkid "/dev/mapper/${MAPPER}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
+  if [ "${LVM_TYPE}" = "LVM2_member" ]; then
+    command -v vgchange &> /dev/null || apt-get install -y lvm2 &> /dev/null
+    VG="$(pvs --noheadings -o vg_name "/dev/mapper/${MAPPER}" 2>/dev/null | tr -d ' ')"
+    vgchange -ay "${VG}" &> /dev/null
+    LV="$(lvs --noheadings -o lv_name "${VG}" 2>/dev/null | tr -d ' ' | head -1)"
+    CHECK_DEV="/dev/${VG}/${LV}"
+  else
+    CHECK_DEV="/dev/mapper/${MAPPER}"
+  fi
+  e2fsck -f "${CHECK_DEV}"
+  RC=$?
+  echo ""
+  tune2fs -l "${CHECK_DEV}" 2>/dev/null
+  echo ""
+  echo "LUKS UUID: $(blkid -s UUID -o value "${LOOP}p${PARTNUM}" 2>/dev/null)"
+  [ "${LVM_TYPE}" = "LVM2_member" ] && vgchange -an "${VG}" &> /dev/null
+  cryptsetup close "${MAPPER}" &> /dev/null
+
+elif [ "${FS_TYPE}" = "vfat" ] || [ "${PARTNUM}" -eq 1 ]; then
+  dosfsck "${LOOP}p${PARTNUM}"
+  RC=$?
+
+elif [ "${FS_TYPE}" = "f2fs" ]; then
+  fsck.f2fs "${LOOP}p${PARTNUM}"
+  RC=$?
+
+else
+  fsck.ext4 -f "${LOOP}p${PARTNUM}"
+  RC=$?
+  if [ "${RC}" -eq 0 ]; then
+    echo ""
+    tune2fs -l "${LOOP}p${PARTNUM}" 2>/dev/null
+  fi
+fi
+
+losetup -d "${LOOP}"
+echo ""
+[ "${RC}" -ne 0 ] && errexit "Filesystem check reported errors (exit code: ${RC})"
+echo "Check complete — no errors found."
+echo ""
