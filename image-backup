@@ -52,6 +52,16 @@ loop_settle()
 # Count partitions in an image file via its GPT/MBR table.
 # NOTE: do NOT use `lsblk | grep -c 'p[0-9]'` -- the parent device name
 # ("loop48") itself contains "p4" and gets counted as a partition.
+fs_uuid()
+{
+  # Probe the device directly; the blkid cache can be empty or stale for
+  # filesystems that were created seconds ago on a recycled loop device.
+  local DEV="$1" U
+  U="$(blkid -p -s UUID -o value "${DEV}" 2>/dev/null)"
+  [ -z "${U}" ] && U="$(blkid -c /dev/null -s UUID -o value "${DEV}" 2>/dev/null)"
+  echo "${U}"
+}
+
 count_parts()
 {
   local IMG="$1"
@@ -204,7 +214,7 @@ detect_encryption()
       RAW="$(dmsetup deps -o devname "/dev/mapper/${CRYPT_DM}" 2>/dev/null \
              | sed 's/.*(\([^)]*\)).*/\1/' | tr -d ' ')"
       LUKS_DEV="/dev/${RAW}"
-      LUKS_UUID="$(blkid -s UUID -o value "${LUKS_DEV}" 2>/dev/null)"
+      LUKS_UUID="$(fs_uuid "${LUKS_DEV}")"
       VG_NAME="$(lvs --noheadings -o vg_name "${ROOT_PART}" 2>/dev/null | tr -d ' ')"
       LV_NAME="$(lvs --noheadings -o lv_name "${ROOT_PART}" 2>/dev/null | tr -d ' ')"
       LV_PATH="${ROOT_PART}"
@@ -217,7 +227,7 @@ detect_encryption()
     if [ "${RAW_TYPE}" = "crypto_LUKS" ]; then
       ENCRYPTED=TRUE
       LUKS_DEV="${ROOT_PART}"
-      LUKS_UUID="$(blkid -s UUID -o value "${LUKS_DEV}" 2>/dev/null)"
+      LUKS_UUID="$(fs_uuid "${LUKS_DEV}")"
       MAPPER_NAME="$(awk '!/^[[:space:]]*#/ && /UUID='"${LUKS_UUID}"'/{print $1}' \
                     /etc/crypttab 2>/dev/null | head -1)"
       [ -z "${MAPPER_NAME}" ] && MAPPER_NAME="crypt_root"
@@ -376,30 +386,73 @@ install_grub()
   mount -t proc proc    "${MNTPATH}/proc"
   mount --bind /run     "${MNTPATH}/run"
 
+  # Resolver inside chroot, so apt/grub can work if network is available
+  if [ ! -s "${MNTPATH}/etc/resolv.conf" ]; then
+    cp /etc/resolv.conf "${MNTPATH}/etc/resolv.conf" 2>/dev/null
+  fi
+
   if [ ! -f "${MNTPATH}/usr/sbin/grub-install" ]; then
     echo "  Installing grub-efi-amd64 in image chroot..."
     chroot "${MNTPATH}" apt-get install -y --no-install-recommends \
       grub-efi-amd64 grub-efi-amd64-bin &> /dev/null
   fi
 
-  # Secure Boot: try to install shim-signed
+  # ---- Determine bootloader-id (distro directory name on the ESP) ----
+  # Ubuntu derivatives (incl. Zorin) ship a SIGNED grubx64.efi whose prefix
+  # is baked in as /EFI/<id>. That binary CANNOT read /boot/grub/grub.cfg
+  # directly -- it reads a stub at /boot/efi/EFI/<id>/grub.cfg. If that stub
+  # is stale (copied by rsync from the live ESP) it points at the LIVE
+  # system's /boot UUID and the image drops to "grub rescue>" when booted
+  # on any other disk. We therefore install BOTH paths and rewrite the stub.
+  local BLID
+  # Read the id from the LIVE ESP: the image ESP is freshly formatted.
+  BLID="$(ls /boot/efi/EFI/ 2>/dev/null \
+          | grep -viE '^(BOOT|Microsoft|tools)$' | head -1)"
+  [ -z "${BLID}" ] && BLID="$(sed -n 's|^GRUB_DISTRIBUTOR=.*"\?\([A-Za-z]\+\).*|\1|p' \
+                              "${MNTPATH}/etc/default/grub" 2>/dev/null | tr 'A-Z' 'a-z' | head -1)"
+  [ -z "${BLID}" ] && BLID="${OSID}"
+  [ -z "${BLID}" ] && BLID="ubuntu"
+  echo "  ESP bootloader-id: ${BLID}"
+
+  local SECURE_BOOT=FALSE
   if chroot "${MNTPATH}" dpkg -l shim-signed &> /dev/null; then
-    echo "  Secure Boot: shim-signed present."
-    chroot "${MNTPATH}" apt-get install -y --no-install-recommends \
-      shim-signed &> /dev/null
+    SECURE_BOOT=TRUE
+    echo "  Secure Boot: shim-signed present (signed GRUB will be used)."
   else
-    echo "  Secure Boot: shim-signed not available; image will use unsigned GRUB."
-    echo "  (Install shim-signed on the live system and re-run for Secure Boot support.)"
+    echo "  Secure Boot: shim-signed not available; unsigned GRUB will be used."
   fi
 
-  chroot "${MNTPATH}" grub-install \
+  # ---- Install 1: removable path  EFI/BOOT/BOOTX64.EFI ----
+  local GRUB_OUT GRUB_RC
+  GRUB_OUT="$(chroot "${MNTPATH}" grub-install \
     --target=x86_64-efi \
     --efi-directory=/boot/efi \
     --boot-directory=/boot \
     --no-nvram \
-    --removable \
-    "${LOOP}" &> /dev/null
-  [ $? -ne 0 ] && echo "  WARNING: grub-install non-zero exit (may be harmless in offline chroot)."
+    --removable 2>&1)"
+  GRUB_RC=$?
+  if [ ${GRUB_RC} -ne 0 ]; then
+    echo "  ERROR: grub-install (removable) failed:"
+    echo "${GRUB_OUT}" | sed 's/^/    /'
+    _grub_unmount
+    errexit "GRUB installation failed — image would not be bootable."
+  fi
+  echo "  Installed: EFI/BOOT/BOOTX64.EFI (removable path)"
+
+  # ---- Install 2: distro path  EFI/<id>/  (writes the prefix stub) ----
+  GRUB_OUT="$(chroot "${MNTPATH}" grub-install \
+    --target=x86_64-efi \
+    --efi-directory=/boot/efi \
+    --boot-directory=/boot \
+    --bootloader-id="${BLID}" \
+    --no-nvram 2>&1)"
+  GRUB_RC=$?
+  if [ ${GRUB_RC} -ne 0 ]; then
+    echo "  WARNING: grub-install (${BLID}) returned non-zero:"
+    echo "${GRUB_OUT}" | sed 's/^/    /'
+  else
+    echo "  Installed: EFI/${BLID}/ (signed-GRUB prefix path)"
+  fi
 
   if [ "${ENCRYPTED}" = "TRUE" ]; then
     _configure_grub_for_luks
@@ -408,21 +461,150 @@ install_grub()
       echo "  WARNING: update-initramfs failed — manual rebuild may be needed."
   fi
 
-  chroot "${MNTPATH}" update-grub &> /dev/null
+  # ---- Regenerate grub.cfg (errors are FATAL, not swallowed) ----
+  echo "  Running update-grub..."
+  GRUB_OUT="$(chroot "${MNTPATH}" update-grub 2>&1)"
+  GRUB_RC=$?
+  if [ ${GRUB_RC} -ne 0 ]; then
+    echo "  ERROR: update-grub failed:"
+    echo "${GRUB_OUT}" | sed 's/^/    /'
+    _grub_unmount
+    errexit "grub.cfg generation failed — image would drop to GRUB rescue."
+  fi
 
+  # ---- Rewrite the ESP prefix stub with the IMAGE's UUIDs ----
+  _write_esp_stub "${BLID}"
+
+  # ---- Verify grub.cfg points at the IMAGE, not the live system ----
+  _verify_grub_config
+
+  _grub_unmount
+  echo "  GRUB installation complete."
+}
+
+_grub_unmount()
+{
   umount "${MNTPATH}/run"     &> /dev/null
   umount "${MNTPATH}/proc"    &> /dev/null
   umount "${MNTPATH}/sys"     &> /dev/null
   umount "${MNTPATH}/dev/pts" &> /dev/null
   umount "${MNTPATH}/dev"     &> /dev/null
+}
 
-  echo "  GRUB installation complete."
+# Write the grub.cfg stub that the signed grubx64.efi reads from the ESP.
+#
+# A plain "search.fs_uuid <uuid> root" stub can fail on some firmware even
+# when the UUID is correct (observed on real hardware: the identical command
+# succeeds when typed at the prompt). When it fails, $root silently stays on
+# the ESP and the machine stops at a bare "grub>" prompt. This stub tries
+# three lookups and only accepts a result that carries this image's own
+# marker file, so it can never pick up another disk's grub.cfg.
+_write_esp_stub()
+{
+  local BLID="$1"
+  local GRUBFS_DEV GRUBFS_PART PREFIX_PATH
+
+  if [ "${THREE_PART}" = "TRUE" ]; then
+    GRUBFS_DEV="${LOOP}p2";                GRUBFS_PART=2; PREFIX_PATH="/grub"
+  else
+    GRUBFS_DEV="${LOOP}p${ROOT_PART_NUM}"; GRUBFS_PART="${ROOT_PART_NUM}"; PREFIX_PATH="/boot/grub"
+  fi
+
+  GRUBFS_UUID="$(fs_uuid "${GRUBFS_DEV}")"
+  if [ -z "${GRUBFS_UUID}" ]; then
+    _grub_unmount
+    errexit "Could not read the UUID of ${GRUBFS_DEV} -- ESP stub cannot be written.\nAborting: the image would stop at a grub> prompt."
+  fi
+
+  # Marker file unique to this image; excluded from rsync so updates keep it.
+  rm -f "${MNTPATH}/boot/grub/.imgbak-"* 2>/dev/null
+  echo "image-backup ${IMGFILE} $(date -Is)" > "${MNTPATH}/boot/grub/.imgbak-${GRUBFS_UUID}"
+
+  local STUB_TEXT
+  STUB_TEXT="$(sed -e "s|@UUID@|${GRUBFS_UUID}|g" \
+                   -e "s|@PREFIX@|${PREFIX_PATH}|g" \
+                   -e "s|@PARTNUM@|${GRUBFS_PART}|g" << 'STUB'
+# Generated by image-backup. Points this ESP at the image's own /boot
+# filesystem. Do not copy this file to another disk.
+set imgbak_prefix=@PREFIX@
+set imgbak_marker=@PREFIX@/.imgbak-@UUID@
+
+# 1) By filesystem UUID
+search --no-floppy --fs-uuid --set=root @UUID@
+
+# 2) Partition @PARTNUM@ on the same disk as this ESP
+if [ ! -e "($root)$imgbak_marker" ]; then
+  if regexp --set 1:imgbak_disk '^\(([^,)]+)' "$cmdpath"; then
+    set root="$imgbak_disk,gpt@PARTNUM@"
+  fi
+fi
+
+# 3) Any disk carrying this image's unique marker file
+if [ ! -e "($root)$imgbak_marker" ]; then
+  search --no-floppy --file --set=root $imgbak_marker
+fi
+
+set prefix=($root)$imgbak_prefix
+configfile $prefix/grub.cfg
+STUB
+)"
+
+  # Write to every GRUB directory on the ESP (EFI/BOOT, EFI/<id>, and
+  # EFI/ubuntu, which is the prefix baked into Ubuntu's signed GRUB and
+  # is also used by derivatives such as Zorin and Mint).
+  local DIR WRITTEN=""
+  for DIR in "${MNTPATH}/boot/efi/EFI/BOOT" \
+             "${MNTPATH}/boot/efi/EFI/${BLID}" \
+             "${MNTPATH}/boot/efi/EFI/ubuntu" \
+             "${MNTPATH}"/boot/efi/EFI/*/; do
+    DIR="${DIR%/}"
+    case "$(basename "${DIR}")" in Microsoft|tools|'*') continue ;; esac
+    [[ " ${WRITTEN} " == *" ${DIR} "* ]] && continue
+    mkdir -p "${DIR}"
+    printf '%s\n' "${STUB_TEXT}" > "${DIR}/grub.cfg"
+    WRITTEN+=" ${DIR}"
+  done
+  echo "  ESP stub written to:$(echo "${WRITTEN}" | sed "s|${MNTPATH}/boot/efi/| |g")"
+  echo "  GRUB filesystem UUID: ${GRUBFS_UUID} (partition ${GRUBFS_PART})"
+}
+
+# Hard-fail if grub.cfg does not point at the image or still points at the
+# live system. A backup that reports success must be bootable.
+_verify_grub_config()
+{
+  local CFG="${MNTPATH}/boot/grub/grub.cfg"
+  if [ ! -s "${CFG}" ]; then
+    _grub_unmount
+    errexit "grub.cfg is missing or empty in the image."
+  fi
+
+  if ! grep -q "${GRUBFS_UUID}" "${CFG}"; then
+    _grub_unmount
+    errexit "grub.cfg does not reference the image's /boot filesystem (${GRUBFS_UUID}).\nThe image would not boot."
+  fi
+
+  local LIVE_UUID
+  for LIVE_UUID in "$(fs_uuid "${ROOT_PART}")" \
+                   "$( [ -n "${LIVE_BOOT_DEV}" ] && fs_uuid "${LIVE_BOOT_DEV}" )"; do
+    [ -z "${LIVE_UUID}" ] && continue
+    if grep -q "${LIVE_UUID}" "${CFG}"; then
+      _grub_unmount
+      errexit "grub.cfg still references the LIVE system's UUID ${LIVE_UUID}.\nThe image would boot the source disk or stop at a GRUB prompt."
+    fi
+  done
+
+  if ! ls "${MNTPATH}"/boot/vmlinuz-* &> /dev/null; then
+    _grub_unmount
+    errexit "No kernel (vmlinuz-*) found in the image's /boot."
+  fi
+
+  echo "  Verified: grub.cfg targets image UUID ${GRUBFS_UUID}; no live UUIDs; kernel present"
 }
 
 _configure_grub_for_luks()
 {
   local IMG_LUKS_UUID
-  IMG_LUKS_UUID="$(blkid -s UUID -o value "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
+  IMG_LUKS_UUID="$(fs_uuid "${LOOP}p${ROOT_PART_NUM}")"
 
   # GRUB root device string using doubled-hyphen convention for LVM
   local ROOT_MAPPER_GRUB
@@ -462,8 +644,8 @@ _update_image_fstab()
   [ -f "${FSTAB}" ] || return
 
   local IMG_EFI_UUID IMG_BOOT_UUID
-  IMG_EFI_UUID="$(blkid -s UUID -o value "${LOOP}p1" 2>/dev/null)"
-  [ "${THREE_PART}" = "TRUE" ] && IMG_BOOT_UUID="$(blkid -s UUID -o value "${LOOP}p2" 2>/dev/null)"
+  IMG_EFI_UUID="$(fs_uuid "${LOOP}p1")"
+  [ "${THREE_PART}" = "TRUE" ] && IMG_BOOT_UUID="$(fs_uuid "${LOOP}p2")"
 
   # EFI partition
   if [ -n "${IMG_EFI_UUID}" ]; then
@@ -484,16 +666,46 @@ _update_image_fstab()
       sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/\s\+ext4\)|${ROOT_MAP}\1|" "${FSTAB}"
     else
       local MAP_UUID
-      MAP_UUID="$(blkid -s UUID -o value "${IMG_LV_PATH}" 2>/dev/null)"
+      MAP_UUID="$(fs_uuid "${IMG_LV_PATH}")"
       [ -n "${MAP_UUID}" ] && \
         sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/\s\)|UUID=${MAP_UUID}\1|" "${FSTAB}"
     fi
   else
     local IMG_ROOT_UUID
-    IMG_ROOT_UUID="$(blkid -s UUID -o value "${LOOP}p${ROOT_PART_NUM}" 2>/dev/null)"
+    IMG_ROOT_UUID="$(fs_uuid "${LOOP}p${ROOT_PART_NUM}")"
     [ -n "${IMG_ROOT_UUID}" ] && \
       sed -i "/^[[:space:]]*#/!s|^[^ ]*\(\s\+/\s\)|UUID=${IMG_ROOT_UUID}\1|" "${FSTAB}"
   fi
+}
+
+# Entries other than /, /boot, /boot/efi and swap point at devices that
+# will not exist on a restored disk (e.g. the backup drive itself at
+# /mnt/usb). Without nofail, systemd waits 90 s per entry at boot and
+# reports "Dependency failed for mnt-usb.mount". Add nofail and a short
+# device timeout so the entry still mounts when the device is present.
+_harden_fstab_extras()
+{
+  local FSTAB="${MNTPATH}/etc/fstab" TMP
+  [ -f "${FSTAB}" ] || return
+  TMP="$(mktemp)"
+  awk '
+    /^[[:space:]]*#/ || NF < 4 { print; next }
+    {
+      spec = $1; mp = $2; fstype = $3; opts = $4
+      if (mp == "/" || mp == "/boot" || mp == "/boot/efi" || fstype == "swap" || mp == "none") { print; next }
+      if (spec !~ /^(UUID=|PARTUUID=|LABEL=|PARTLABEL=|\/dev\/)/) { print; next }
+      changed = 0
+      if (opts !~ /(^|,)nofail(,|$)/)           { opts = opts ",nofail"; changed = 1 }
+      if (opts !~ /x-systemd\.device-timeout=/) { opts = opts ",x-systemd.device-timeout=10s"; changed = 1 }
+      if (!changed) { print; next }
+      $4 = opts
+      print "# image-backup: nofail added -- this device may be absent on a restored disk"
+      print
+      n++
+    }
+    END { if (n) printf "  fstab: %d non-system mount(s) marked nofail\n", n > "/dev/stderr" }
+  ' OFS='\t' "${FSTAB}" > "${TMP}" && cat "${TMP}" > "${FSTAB}"
+  rm -f "${TMP}"
 }
 
 _update_image_crypttab()
@@ -599,15 +811,30 @@ backup()
     "--exclude=/var/cache/apt/archives"
     "--exclude=/etc/udev/rules.d/70-persistent-net.rules"
     "--exclude=/var/lib/asterisk/astdb.sqlite3-journal"
+    "--exclude=/boot/grub/.imgbak-*"
   )
 
-  echo "  Running rsync..."
+  echo "  Running rsync (/)..."
   rsync -aHDx --partial --numeric-ids --delete --force \
     "${EXCL[@]}" "${OPTIONS[@]}" \
     / "${MNTPATH}/"
   local RC=$?
   if [[ ${RC} -ne 0 && ${RC} -ne 24 ]]; then
     errexit "rsync failed (exit code: ${RC})"
+  fi
+
+  # rsync -x does not cross into a separately mounted /boot, so on
+  # 3-partition and LUKS systems the kernels and initrds would never reach
+  # the image. Copy it as its own transfer.
+  if [ "${THREE_PART}" = "TRUE" ] && mountpoint -q /boot; then
+    echo "  Running rsync (/boot)..."
+    rsync -aHDx --partial --numeric-ids --delete --force \
+      --exclude='/efi' --exclude='/grub/.imgbak-*' "${OPTIONS[@]}" \
+      /boot/ "${MNTPATH}/boot/"
+    RC=$?
+    if [[ ${RC} -ne 0 && ${RC} -ne 24 ]]; then
+      errexit "rsync of /boot failed (exit code: ${RC})"
+    fi
   fi
 
   # Recreate excluded virtual dirs
@@ -617,6 +844,7 @@ backup()
   chmod a+rwxt "${MNTPATH}/tmp/"
 
   _update_image_fstab
+  _harden_fstab_extras
 
   [ "${NOEXPAND}" = "FALSE" ] && inject_resize_service
 
@@ -1028,7 +1256,22 @@ else
     THREE_PART=FALSE; ROOT_PART_NUM=2
   fi
 
+  if [ "${ENCRYPTED}" = "TRUE" ] && [ -z "${IMG_LUKS_PASSPHRASE}" ]; then
+    echo -n "Enter the image's LUKS passphrase: "
+    read -rs IMG_LUKS_PASSPHRASE; echo ""
+  fi
+
+  echo ""
+  echo "Starting incremental update..."
   backup
+
+  # rsync has just replaced the image's grub.cfg (and on LUKS systems its
+  # crypttab and initrd) with the live system's copies, which reference the
+  # live disk. Regenerate them against the image, exactly as the initial
+  # backup does.
+  mntimg
+  install_grub
+  umntimg
 
 fi
 
