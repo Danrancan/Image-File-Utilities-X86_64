@@ -184,6 +184,20 @@ On first boot after restore:
 
 ---
 
+## What image-backup changes inside the image
+
+After every run (initial **and** incremental), the script rewrites the parts of the copied system that would otherwise still point at the source disk:
+
+| Item | What is done |
+|---|---|
+| `/etc/fstab` | `/`, `/boot` and `/boot/efi` point at the image's own UUIDs. Every other block-device mount (for example the backup drive at `/mnt/usb`) gets `nofail,x-systemd.device-timeout=10s`, so a missing drive no longer stalls boot for 90 s |
+| `/boot/grub/grub.cfg` | Regenerated with `update-grub` inside the image. Incremental rsync overwrites it with the live copy, so it is rebuilt every time |
+| ESP `grub.cfg` stub | Written to `EFI/BOOT`, `EFI/<distro>` and `EFI/ubuntu`. It finds `/boot` by UUID, then by partition number on the same disk as the ESP, then by a marker file unique to the image (`/boot/grub/.imgbak-<uuid>`) |
+| Separate `/boot` | Copied with its own rsync pass, because `rsync -x` does not enter other filesystems |
+| Verification | The backup **fails** if `grub.cfg` doesn't reference the image, still references the live disk, or no kernel is present |
+
+---
+
 ## Utility commands
 
 ```bash
