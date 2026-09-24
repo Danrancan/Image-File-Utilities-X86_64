@@ -1,6 +1,6 @@
 # Image-File-Utilities-X86_64
 
-**Bootable `.img` backup solution for live Ubuntu 24.04 / Debian 13 x86_64 servers.**
+**Bootable `.img` backup solution for live Ubuntu 24.04 / Debian 13 x86_64 servers. Tested on Ubuntu 24.04 and Ubuntu 26.04.**
 
 A full adaptation of [RonR's Image File Utilities](https://forums.raspberrypi.com/viewtopic.php?t=332000) (originally for Raspberry Pi), ported to x86_64 with support for:
 
