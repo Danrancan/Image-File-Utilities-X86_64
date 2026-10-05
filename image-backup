@@ -197,53 +197,105 @@ check_dep()
 detect_encryption()
 {
   ENCRYPTED=FALSE
-  local DEVTYPE
-  DEVTYPE="$(lsblk -no TYPE "${ROOT_PART}" 2>/dev/null | head -1)"
+  LUKS_DEV=""; LUKS_UUID=""; MAPPER_NAME=""
+  VG_NAME=""; LV_NAME=""; LV_PATH=""; ROOT_DISK=""
 
-  if [[ "${DEVTYPE}" = "lvm" || "${DEVTYPE}" = "dm" ]]; then
-    # Root is an LVM logical volume — walk the device chain for a crypt layer
-    local CHAIN
-    CHAIN="$(lsblk -sno NAME,TYPE "${ROOT_PART}" 2>/dev/null)"
-    if echo "${CHAIN}" | grep -q "crypt"; then
-      ENCRYPTED=TRUE
-      local CRYPT_DM
-      CRYPT_DM="$(echo "${CHAIN}" | awk '$2=="crypt"{print $1}' | head -1)"
-      MAPPER_NAME="${CRYPT_DM}"
-      # Find the underlying block device of the crypt mapper
-      local RAW
-      RAW="$(dmsetup deps -o devname "/dev/mapper/${CRYPT_DM}" 2>/dev/null \
-             | sed 's/.*(\([^)]*\)).*/\1/' | tr -d ' ')"
-      LUKS_DEV="/dev/${RAW}"
-      LUKS_UUID="$(fs_uuid "${LUKS_DEV}")"
+  # Full device chain for the root filesystem, innermost first.
+  #
+  # -r (raw) is essential. Without it lsblk draws a tree and device names
+  # come back as "|-dm_crypt-0", which silently breaks every lookup built
+  # on them. -p returns full device paths. A typical LVM-on-LUKS root:
+  #
+  #   /dev/mapper/ubuntu--vg-ubuntu--lv lvm
+  #   /dev/mapper/dm_crypt-0            crypt
+  #   /dev/nvme0n1p3                    part
+  #   /dev/nvme0n1                      disk
+  local CHAIN
+  CHAIN="$(lsblk -rpsno NAME,TYPE "${ROOT_PART}" 2>/dev/null)"
+  [ -z "${CHAIN}" ] && errexit "Unable to read the device chain for ${ROOT_PART}"
+
+  ROOT_DISK="$(awk '$2=="disk"{print $1; exit}' <<< "${CHAIN}")"
+
+  if awk '$2=="crypt"{f=1} END{exit !f}' <<< "${CHAIN}"; then
+    # dm-crypt layer somewhere beneath the root filesystem
+    ENCRYPTED=TRUE
+    check_dep cryptsetup cryptsetup
+    check_dep lvs        lvm2
+
+    local MAPPER_DEV
+    MAPPER_DEV="$(awk '$2=="crypt"{print $1; exit}' <<< "${CHAIN}")"
+    MAPPER_NAME="$(basename "${MAPPER_DEV}")"
+
+    # First real block device beneath the crypt layer holds the LUKS header
+    LUKS_DEV="$(awk '$2=="crypt"{seen=1; next}
+                     seen && ($2=="part" || $2=="disk"){print $1; exit}' <<< "${CHAIN}")"
+    LUKS_UUID="$(fs_uuid "${LUKS_DEV}")"
+
+    # LVM inside the container?
+    if [ "$(awk 'NR==1{print $2}' <<< "${CHAIN}")" = "lvm" ]; then
       VG_NAME="$(lvs --noheadings -o vg_name "${ROOT_PART}" 2>/dev/null | tr -d ' ')"
       LV_NAME="$(lvs --noheadings -o lv_name "${ROOT_PART}" 2>/dev/null | tr -d ' ')"
       LV_PATH="${ROOT_PART}"
     fi
-  fi
 
-  if [ "${ENCRYPTED}" = "FALSE" ]; then
-    local RAW_TYPE
-    RAW_TYPE="$(blkid "${ROOT_PART}" | sed -n 's|.*TYPE="\([^"]*\)".*|\1|p')"
-    if [ "${RAW_TYPE}" = "crypto_LUKS" ]; then
-      ENCRYPTED=TRUE
-      LUKS_DEV="${ROOT_PART}"
-      LUKS_UUID="$(fs_uuid "${LUKS_DEV}")"
-      MAPPER_NAME="$(awk '!/^[[:space:]]*#/ && /UUID='"${LUKS_UUID}"'/{print $1}' \
-                    /etc/crypttab 2>/dev/null | head -1)"
-      [ -z "${MAPPER_NAME}" ] && MAPPER_NAME="crypt_root"
-      LV_PATH="/dev/mapper/${MAPPER_NAME}"
-      VG_NAME=""
-      LV_NAME=""
-    fi
+  elif [ "$(blkid -p -s TYPE -o value "${ROOT_PART}" 2>/dev/null)" = "crypto_LUKS" ]; then
+    # LUKS directly on the root partition, no LVM
+    ENCRYPTED=TRUE
+    check_dep cryptsetup cryptsetup
+    LUKS_DEV="${ROOT_PART}"
+    LUKS_UUID="$(fs_uuid "${LUKS_DEV}")"
+    MAPPER_NAME="$(awk '!/^[[:space:]]*#/ && /UUID='"${LUKS_UUID}"'/{print $1}' \
+                  /etc/crypttab 2>/dev/null | head -1)"
+    [ -z "${MAPPER_NAME}" ] && MAPPER_NAME="crypt_root"
+    LV_PATH="/dev/mapper/${MAPPER_NAME}"
   fi
 
   if [ "${ENCRYPTED}" = "TRUE" ]; then
+    # Refuse to continue on a half-resolved chain rather than failing later
+    # with a confusing message.
+    if [ -z "${LUKS_DEV}" ] || [ ! -b "${LUKS_DEV}" ] || [ -z "${LUKS_UUID}" ]; then
+      echo ""
+      echo "Device chain reported by lsblk:"
+      echo "${CHAIN}" | sed 's/^/    /'
+      errexit "Could not resolve the LUKS container for ${ROOT_PART}.\nResolved: LUKS_DEV='${LUKS_DEV}' UUID='${LUKS_UUID}'"
+    fi
     echo "  Encrypted root detected:"
     echo "    LUKS device : ${LUKS_DEV}"
     echo "    LUKS UUID   : ${LUKS_UUID}"
     echo "    Mapper name : ${MAPPER_NAME}"
     [ -n "${VG_NAME}" ] && echo "    LVM VG      : ${VG_NAME}"
     [ -n "${LV_NAME}" ] && echo "    LVM LV      : ${LV_NAME}"
+
+    # Only the root LV is cloned. Any other LV in the VG (a separate /home,
+    # for example) is a different filesystem and is NOT copied.
+    if [ -n "${VG_NAME}" ]; then
+      local OTHER_LVS
+      OTHER_LVS="$(lvs --noheadings -o lv_name "${VG_NAME}" 2>/dev/null \
+                   | tr -d ' ' | grep -v "^${LV_NAME}$" | tr '\n' ' ')"
+      if [ -n "${OTHER_LVS}" ]; then
+        echo ""
+        echo "  NOTE: volume group ${VG_NAME} also contains: ${OTHER_LVS}"
+        echo "        Only the root volume (${LV_NAME}) is cloned into the image."
+      fi
+    fi
+  fi
+}
+
+# Filesystems mounted outside /, /boot and /boot/efi are skipped by rsync -x
+# and will be EMPTY in the image. Say so plainly before any copying starts.
+_warn_skipped_mounts()
+{
+  local SKIPPED
+  SKIPPED="$(findmnt -rno TARGET,SOURCE,FSTYPE \
+    | awk '$3 !~ /^(proc|sysfs|devtmpfs|devpts|tmpfs|ramfs|squashfs|overlay|autofs|cgroup|cgroup2|securityfs|pstore|efivarfs|bpf|mqueue|hugetlbfs|debugfs|tracefs|fusectl|configfs|nsfs|binfmt_misc|rpc_pipefs|iso9660|vfat)$/ &&
+           $1 != "/" && $1 != "/boot" && $1 != "/boot/efi" &&
+           $1 !~ /^\/(dev|proc|sys|run|tmp|snap|media|mnt|var\/snap|var\/lib\/docker)(\/|$)/ {
+             printf "    %-28s %s (%s)\n", $1, $2, $3 }')"
+  if [ -n "${SKIPPED}" ]; then
+    echo ""
+    echo "  These mounted filesystems are NOT included in the image:"
+    echo "${SKIPPED}"
+    echo "  Their mount points will exist but be empty after a restore."
   fi
 }
 
@@ -318,9 +370,9 @@ setup_luks_image()
 
   if [ -n "${VG_NAME}" ]; then
     echo "  Creating LVM inside LUKS container..."
-    pvcreate "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null || errexit "pvcreate failed"
-    vgcreate "${IMG_VG_NAME}" "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null || errexit "vgcreate failed"
-    lvcreate -l 100%FREE -n "${IMG_LV_NAME}" "${IMG_VG_NAME}" &> /dev/null || errexit "lvcreate failed"
+    pvcreate -y -ff "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null || errexit "pvcreate failed"
+    vgcreate -y "${IMG_VG_NAME}" "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null || errexit "vgcreate failed"
+    lvcreate -y -l 100%FREE -n "${IMG_LV_NAME}" "${IMG_VG_NAME}" &> /dev/null || errexit "lvcreate failed"
     IMG_LV_PATH="/dev/${IMG_VG_NAME}/${IMG_LV_NAME}"
   fi
 
@@ -593,6 +645,22 @@ _verify_grub_config()
     fi
   done
 
+  if [ "${ENCRYPTED}" = "TRUE" ] && [ -n "${IMG_VG_NAME}" ]; then
+    local IMG_MAP="${IMG_VG_NAME//-/--}-${IMG_LV_NAME//-/--}"
+    local LIVE_MAP="${VG_NAME//-/--}-${LV_NAME//-/--}"
+    local IMG_LV_UUID
+    IMG_LV_UUID="$(fs_uuid "${IMG_LV_PATH}")"
+    if grep -qF "/dev/mapper/${LIVE_MAP}" "${CFG}"; then
+      _grub_unmount
+      errexit "grub.cfg still points at the LIVE volume /dev/mapper/${LIVE_MAP}."
+    fi
+    if ! grep -qF "${IMG_MAP}" "${CFG}" && ! { [ -n "${IMG_LV_UUID}" ] && grep -qF "${IMG_LV_UUID}" "${CFG}"; }; then
+      _grub_unmount
+      errexit "grub.cfg does not reference the image's root volume (${IMG_MAP})."
+    fi
+    echo "  Verified: grub.cfg root volume is the image's (${IMG_MAP})"
+  fi
+
   if ! ls "${MNTPATH}"/boot/vmlinuz-* &> /dev/null; then
     _grub_unmount
     errexit "No kernel (vmlinuz-*) found in the image's /boot."
@@ -621,8 +689,9 @@ _configure_grub_for_luks()
     # Clean any prior crypto params
     sed -i 's|cryptdevice=[^ "]*||g' "${GRUB_DEFAULT}"
     sed -i 's|rd\.luks\.uuid=[^ "]*||g' "${GRUB_DEFAULT}"
-    # Inject crypto kernel params into GRUB_CMDLINE_LINUX
-    sed -i "s|^GRUB_CMDLINE_LINUX=\"\(.*\)\"|GRUB_CMDLINE_LINUX=\"\1 cryptdevice=UUID=${IMG_LUKS_UUID}:${IMG_LUKS_MAPPER} root=${ROOT_MAPPER_GRUB}\"|" \
+    # Ubuntu/Debian unlock from /etc/crypttab inside the initramfs, so only
+    # root= is needed here; it also overrides anything stale from the source.
+    sed -i "s|^GRUB_CMDLINE_LINUX=\"\(.*\)\"|GRUB_CMDLINE_LINUX=\"\1 root=${ROOT_MAPPER_GRUB}\"|" \
       "${GRUB_DEFAULT}"
     # Enable GRUB cryptodisk module (needed to unlock LUKS before loading kernel)
     grep -q "GRUB_ENABLE_CRYPTODISK" "${GRUB_DEFAULT}" || \
@@ -632,6 +701,40 @@ _configure_grub_for_luks()
   fi
 
   _update_image_crypttab "${IMG_LUKS_UUID}"
+  _fix_image_lvm_devices_file
+  _fix_image_resume
+}
+
+# LVM's devices file (Ubuntu 22.04+) lists the exact PVs LVM may use. The
+# copy inherited from the live system names the LIVE PV, so a restored image
+# would ignore its own PV and fail to find root in the initramfs. Removing it
+# restores "scan every device", which is what a cloned disk needs. Must run
+# before update-initramfs, which bakes this file into the initrd.
+_fix_image_lvm_devices_file()
+{
+  local DEVFILE="${MNTPATH}/etc/lvm/devices/system.devices"
+  if [ -f "${DEVFILE}" ]; then
+    rm -f "${DEVFILE}"
+    echo "  Removed stale LVM devices file (image will scan all devices)"
+  fi
+}
+
+# A RESUME= pointing at a hibernation device that does not exist on the
+# restored disk makes boot wait for it. Drop it unless it names a device
+# that is actually present in the image.
+_fix_image_resume()
+{
+  local RESUMEFILE="${MNTPATH}/etc/initramfs-tools/conf.d/resume"
+  [ -f "${RESUMEFILE}" ] || return
+  local SPEC
+  SPEC="$(sed -n 's|^RESUME=\(.*\)$|\1|p' "${RESUMEFILE}" | tr -d '"' | head -1)"
+  [ -z "${SPEC}" ] && return
+  [ "${SPEC}" = "none" ] && return
+  if [ -n "${IMG_LV_PATH}" ] && [ "${SPEC}" = "${IMG_LV_PATH}" ]; then
+    return
+  fi
+  echo "RESUME=none" > "${RESUMEFILE}"
+  echo "  Disabled stale hibernation resume device (${SPEC})"
 }
 
 # =============================================================================
@@ -731,12 +834,50 @@ inject_resize_service()
   if [ "${ENCRYPTED}" = "TRUE" ] && [ -n "${VG_NAME}" ]; then
     cat > "${SCRIPTFILE}" << 'SCRIPT'
 #!/bin/bash
-# Expand LVM LV and filesystem to fill all free space in VG
-VG="$(lvs --noheadings -o vg_name / 2>/dev/null | tr -d ' ' | head -1)"
-LV="$(lvs --noheadings -o lv_name / 2>/dev/null | tr -d ' ' | head -1)"
-if [ -n "${VG}" ] && [ -n "${LV}" ]; then
-  lvextend -l +100%FREE "${VG}/${LV}" &> /dev/null
+# Grow LUKS partition -> LUKS mapping -> LVM PV -> root LV -> filesystem.
+# Every layer has to grow in order; stopping early leaves the restored
+# system at the shrunken backup size.
+set -u
+log() { echo "resize-root-fs: $*"; }
+
+ROOT_SRC="$(findmnt -no SOURCE /)"
+VG="$(lvs --noheadings -o vg_name "${ROOT_SRC}" 2>/dev/null | tr -d ' ')"
+LV="$(lvs --noheadings -o lv_name "${ROOT_SRC}" 2>/dev/null | tr -d ' ')"
+if [ -z "${VG}" ] || [ -z "${LV}" ]; then
+  log "root ${ROOT_SRC} is not an LVM volume; nothing to do"
+else
+  PV="$(vgs --noheadings -o pv_name "${VG}" 2>/dev/null | tr -d ' ' | head -1)"
+  CRYPT="$(basename "${PV}")"
+  CHAIN="$(lsblk -rpsno NAME,TYPE "${PV}" 2>/dev/null)"
+  LUKS_PART="$(awk '$2=="part"{print $1; exit}' <<< "${CHAIN}")"
+  DISK="$(awk '$2=="disk"{print $1; exit}' <<< "${CHAIN}")"
+  PARTNUM="$(grep -o '[0-9]*$' <<< "${LUKS_PART}")"
+
+  if [ -n "${DISK}" ] && [ -n "${PARTNUM}" ]; then
+    log "growing ${LUKS_PART} to fill ${DISK}"
+    sgdisk -e "${DISK}" > /dev/null 2>&1
+    INFO="$(sgdisk -i "${PARTNUM}" "${DISK}" 2>/dev/null)"
+    START="$(sed -n 's|^First sector: \([0-9]*\).*|\1|p' <<< "${INFO}")"
+    PGUID="$(sed -n 's|^Partition unique GUID: \([^ ]*\).*|\1|p' <<< "${INFO}")"
+    if [ -n "${START}" ]; then
+      sgdisk -d "${PARTNUM}" "${DISK}" > /dev/null 2>&1
+      sgdisk -n "${PARTNUM}:${START}:0" -t "${PARTNUM}:8309" "${DISK}" > /dev/null 2>&1
+      [ -n "${PGUID}" ] && sgdisk -u "${PARTNUM}:${PGUID}" "${DISK}" > /dev/null 2>&1
+      # The disk is in use, so ask the kernel to update just this partition
+      partx -u "${LUKS_PART}" 2>/dev/null || partprobe "${DISK}" 2>/dev/null
+      sleep 1
+    fi
+  fi
+
+  # Volume key is already in the kernel keyring, so no passphrase needed
+  log "resizing LUKS mapping ${CRYPT}"
+  cryptsetup resize "${CRYPT}" || log "cryptsetup resize failed"
+  log "resizing PV ${PV}"
+  pvresize "${PV}" > /dev/null 2>&1 || log "pvresize failed"
+  log "extending ${VG}/${LV}"
+  lvextend -l +100%FREE "${VG}/${LV}" > /dev/null 2>&1
   resize2fs "/dev/${VG}/${LV}"
+  log "root filesystem is now $(df -h / | awk 'NR==2{print $2}')"
 fi
 systemctl disable resize-root-fs.service
 rm -f /etc/systemd/system/resize-root-fs.service
@@ -814,6 +955,7 @@ backup()
     "--exclude=/boot/grub/.imgbak-*"
   )
 
+  _warn_skipped_mounts
   echo "  Running rsync (/)..."
   rsync -aHDx --partial --numeric-ids --delete --force \
     "${EXCL[@]}" "${OPTIONS[@]}" \
@@ -1060,13 +1202,18 @@ if [ "${ENCRYPTED}" = "TRUE" ]; then
   check_dep pvcreate   lvm2
 fi
 
-# Determine root disk
-if [ "${ENCRYPTED}" = "TRUE" ]; then
-  ROOT_DISK="/dev/$(lsblk -no pkname "${LUKS_DEV}" 2>/dev/null | head -1)"
-else
-  ROOT_DISK="/dev/$(lsblk -no pkname "${ROOT_PART}" 2>/dev/null | head -1)"
+# Root disk comes from the device chain walked in detect_encryption;
+# fall back to pkname only if that came up empty.
+if [ -z "${ROOT_DISK}" ]; then
+  if [ "${ENCRYPTED}" = "TRUE" ] && [ -n "${LUKS_DEV}" ]; then
+    ROOT_DISK="/dev/$(lsblk -no pkname "${LUKS_DEV}" 2>/dev/null | head -1)"
+  else
+    ROOT_DISK="/dev/$(lsblk -no pkname "${ROOT_PART}" 2>/dev/null | head -1)"
+  fi
 fi
-[ "${ROOT_DISK}" = "/dev/" ] && errexit "Cannot determine root disk device"
+if [ -z "${ROOT_DISK}" ] || [ "${ROOT_DISK}" = "/dev/" ] || [ ! -b "${ROOT_DISK}" ]; then
+  errexit "Cannot determine root disk device (got '${ROOT_DISK}')"
+fi
 
 # Partition layout
 if [ "${ENCRYPTED}" = "TRUE" ]; then
@@ -1079,7 +1226,14 @@ fi
 if [ "${THREE_PART}" = "TRUE" ]; then
   ROOT_PART_NUM=3
   EFI_SIZE_MB=512
+  # Size /boot from what the live system actually uses. A fixed 1 GB can
+  # overflow on systems holding several kernels, and rsync would fail.
   BOOT_SIZE_MB=1024
+  if mountpoint -q /boot; then
+    BOOT_USED_MB=$(( $(df -Pk /boot | awk 'NR==2{print $3}') / 1024 ))
+    BOOT_NEED_MB=$(( (BOOT_USED_MB * 2) + 256 ))
+    [ ${BOOT_NEED_MB} -gt ${BOOT_SIZE_MB} ] && BOOT_SIZE_MB=${BOOT_NEED_MB}
+  fi
   LIVE_EFI_DEV="$(awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {print $1}' /etc/fstab | head -1)"
   LIVE_BOOT_DEV="$(awk '!/^[[:space:]]*#/ && $2=="/boot" && $3~/ext/ {print $1}' /etc/fstab | head -1)"
 else
@@ -1205,10 +1359,14 @@ if [ -z "${IMGFILE}" ]; then
   mkloop
   mkfs.vfat -F 32 -n "EFI" "${LOOP}p1" &> /dev/null || errexit "Unable to create EFI filesystem"
   dosfsck "${LOOP}p1" > /dev/null
-  [ "${THREE_PART}" = "TRUE" ] && \
-    mkfs.ext4 -b 4096 -L boot -q "${LOOP}p2" > /dev/null || true
-  [ "${ENCRYPTED}" = "FALSE" ] && \
-    mkfs.ext4 -b 4096 -L rootfs -q "${LOOP}p${ROOT_PART_NUM}" > /dev/null || true
+  if [ "${THREE_PART}" = "TRUE" ]; then
+    mkfs.ext4 -b 4096 -L boot -q "${LOOP}p2" > /dev/null \
+      || errexit "Unable to create /boot filesystem (${BOOT_SIZE_MB} MB)"
+  fi
+  if [ "${ENCRYPTED}" = "FALSE" ]; then
+    mkfs.ext4 -b 4096 -L rootfs -q "${LOOP}p${ROOT_PART_NUM}" > /dev/null \
+      || errexit "Unable to create ROOT filesystem"
+  fi
   rmloop
 
   # LUKS setup (if encrypted)

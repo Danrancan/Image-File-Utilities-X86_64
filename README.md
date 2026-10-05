@@ -140,11 +140,16 @@ When the live system has a LUKS-encrypted root:
 3. The LV is formatted **ext4** and the live system is **rsync'd** into it
 4. `/etc/crypttab` inside the image is updated with the **new LUKS UUID**
 5. `/etc/fstab` inside the image is updated to reference the **new LV mapper path**
-6. **initramfs is rebuilt** inside a chroot so it includes `cryptsetup` and `lvm2` modules
-7. **GRUB is configured** with `cryptdevice=UUID=<luks-uuid>:<mapper>` and `GRUB_ENABLE_CRYPTODISK=y`
-8. A **first-boot systemd service** expands the LV and filesystem to fill the destination disk on restore
+6. The **stale LVM devices file** (`/etc/lvm/devices/system.devices`) is removed, so the restored system scans for its own PV instead of the source machine's
+7. **initramfs is rebuilt** inside a chroot so it includes `cryptsetup` and `lvm2`, the new crypttab, and no stale hibernation device
+8. **GRUB is configured** with `root=` pointing at the image's own LV
+9. A **first-boot systemd service** grows every layer in order — GPT partition, LUKS mapping, LVM PV, root LV, then the filesystem
 
 The image uses its **own** LUKS passphrase (not the live system's passphrase). The live system is never decrypted or modified.
+
+The image VG is named `<live-vg>img` (for example `ubuntu-vgimg`), because a VG with the live system's name is already active while the backup runs and duplicate VG names cannot both be activated.
+
+**Only the root logical volume is cloned.** If the volume group holds other LVs — a separate `/home`, for example — they are different filesystems and are not copied; the script lists them before starting. The same applies to any other mounted filesystem, which `rsync -x` never enters.
 
 ---
 
