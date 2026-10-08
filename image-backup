@@ -458,8 +458,17 @@ install_grub()
   # on any other disk. We therefore install BOTH paths and rewrite the stub.
   local BLID
   # Read the id from the LIVE ESP: the image ESP is freshly formatted.
-  BLID="$(ls /boot/efi/EFI/ 2>/dev/null \
-          | grep -viE '^(BOOT|Microsoft|tools)$' | head -1)"
+  # Prefer the directory that actually holds GRUB — an OEM folder such as
+  # EFI/Dell sorts first alphabetically but is firmware data, not a loader.
+  local D
+  for D in /boot/efi/EFI/*/; do
+    [ -e "${D}grubx64.efi" ] || [ -e "${D}shimx64.efi" ] || continue
+    case "$(basename "${D}")" in BOOT|boot|Microsoft) continue ;; esac
+    BLID="$(basename "${D}")"
+    break
+  done
+  [ -z "${BLID}" ] && BLID="$(ls /boot/efi/EFI/ 2>/dev/null \
+          | grep -viE '^(BOOT|Microsoft|tools|Dell|HP|Lenovo|ASUS|Acer|MSI|Gigabyte|INSYDE|OEM)$' | head -1)"
   [ -z "${BLID}" ] && BLID="$(sed -n 's|^GRUB_DISTRIBUTOR=.*"\?\([A-Za-z]\+\).*|\1|p' \
                               "${MNTPATH}/etc/default/grub" 2>/dev/null | tr 'A-Z' 'a-z' | head -1)"
   [ -z "${BLID}" ] && BLID="${OSID}"
@@ -1047,8 +1056,13 @@ _shrink_plain_ext4()
   fi
   NEWEND=$(( START + (NEWSIZE * (BLKSIZE / 512)) + ((ADDMB * ONEMB) / 512) - 1 + 33 ))
 
-  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
-  _rebuild_gpt "${START}" "8300" "Linux root"
+  CUR_BYTES="$(stat -c %s "${IMGFILE}")"
+  if [ $(( (NEWEND + 1) * 512 )) -lt "${CUR_BYTES}" ]; then
+    truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+    _rebuild_gpt "${START}" "8300" "Linux root"
+  else
+    echo "  Image is already at its minimum size — nothing to truncate."
+  fi
 
   if [ "${ADDMB}" -ne 0 ]; then
     e2fsck -f -n "${LOOP}p${ROOT_PART_NUM}" || fsckerr "before expand"
@@ -1058,53 +1072,134 @@ _shrink_plain_ext4()
   rmloop
 }
 
+# Run an LVM/cryptsetup step non-interactively and surface any failure.
+#
+# These tools prompt on stdin in several situations (pvresize asks
+# "Proceed? [y/n]" when asked for a size larger than the device). With output
+# sent to /dev/null the prompt is invisible and the backup hangs forever, so
+# every call closes stdin and keeps its output.
+_run_step()
+{
+  local DESC="$1"; shift
+  local OUT RC
+  OUT="$("$@" 2>&1 </dev/null)"; RC=$?
+  if [ ${RC} -ne 0 ]; then
+    echo "    ${DESC} failed (exit ${RC}):"
+    echo "${OUT}" | sed 's/^/      /'
+  fi
+  return ${RC}
+}
+
+_abort_luks_shrink()
+{
+  _deactivate_image_lvm
+  cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
+  IMG_MAPPER_OPEN=FALSE
+  rmloop
+}
+
 _shrink_luks_lvm()
 {
   mkloop
   _open_image_luks
 
   local LV_DEV="${IMG_LV_PATH}"
-  echo "  Phase 1: Shrink ext4 on LV..."
-  e2fsck -f -n "${LV_DEV}" || { _deactivate_image_lvm; cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "before"; }
-  echo ""
-  resize2fs -f -M "${LV_DEV}"
-  resize2fs -f -M "${LV_DEV}"
-  resize2fs -f -M "${LV_DEV}"
-  e2fsck -f -n "${LV_DEV}" || { _deactivate_image_lvm; cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "after"; }
+  local CRYPT_DEV="/dev/mapper/${IMG_LUKS_MAPPER}"
+  local PART_DEV="${LOOP}p${ROOT_PART_NUM}"
 
-  local INFO NEWSIZE BLKSIZE
+  echo "  Phase 1: Shrink ext4 on ${LV_DEV}..."
+  e2fsck -f -n "${LV_DEV}" || { _abort_luks_shrink; fsckerr "before"; }
+  echo ""
+  resize2fs -f -M "${LV_DEV}" </dev/null
+  resize2fs -f -M "${LV_DEV}" </dev/null
+  resize2fs -f -M "${LV_DEV}" </dev/null
+  e2fsck -f -n "${LV_DEV}" || { _abort_luks_shrink; fsckerr "after"; }
+
+  local INFO NEWSIZE BLKSIZE FS_BYTES TARGET_LV_BYTES
   INFO="$(tune2fs -l "${LV_DEV}" 2>/dev/null)"
   NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
   BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
-  local NEW_LV_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
+  if ! [[ "${NEWSIZE}" =~ ^[0-9]+$ && "${BLKSIZE}" =~ ^[0-9]+$ ]]; then
+    _abort_luks_shrink
+    errexit "Could not read filesystem geometry from ${LV_DEV}."
+  fi
+  FS_BYTES=$(( NEWSIZE * BLKSIZE ))
+  TARGET_LV_BYTES=$(( FS_BYTES + (ADDMB * ONEMB) ))
 
-  echo "  Phase 2: Reduce LV..."
-  lvreduce --force -L "${NEW_LV_BYTES}B" "${IMG_VG_NAME}/${IMG_LV_NAME}" &> /dev/null
+  # Current geometry, in 512-byte sectors
+  local LV_SECTORS CRYPT_SECTORS PART_SECTORS HEADER_SECTORS
+  LV_SECTORS="$(blockdev --getsz "${LV_DEV}" 2>/dev/null)"
+  CRYPT_SECTORS="$(blockdev --getsz "${CRYPT_DEV}" 2>/dev/null)"
+  PART_SECTORS="$(blockdev --getsz "${PART_DEV}" 2>/dev/null)"
+  if ! [[ "${CRYPT_SECTORS}" =~ ^[0-9]+$ && "${PART_SECTORS}" =~ ^[0-9]+$ ]]; then
+    _abort_luks_shrink
+    errexit "Could not read device sizes for the image's LUKS container."
+  fi
+  HEADER_SECTORS=$(( PART_SECTORS - CRYPT_SECTORS ))   # LUKS header area
 
-  echo "  Phase 3: Resize LVM PV..."
-  local NEW_PV_BYTES=$(( NEW_LV_BYTES + (32 * ONEMB) ))
-  pvresize --setphysicalvolumesize "${NEW_PV_BYTES}B" \
-    "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null
+  echo "  Phase 2: Reduce logical volume..."
+  if [ $(( TARGET_LV_BYTES / 512 )) -lt "${LV_SECTORS}" ]; then
+    _run_step "lvreduce" lvreduce -y -f -L "${TARGET_LV_BYTES}B" \
+      "${IMG_VG_NAME}/${IMG_LV_NAME}"
+  else
+    echo "    Filesystem is already at its minimum size — LV left unchanged."
+  fi
 
-  echo "  Phase 4: Resize LUKS data area..."
-  local NEW_LUKS_SECTORS=$(( (NEW_PV_BYTES + (4 * ONEMB)) / 512 ))
-  cryptsetup resize --size "${NEW_LUKS_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+  echo "  Phase 3: Resize LVM physical volume..."
+  local PE_START EXT_SIZE ALLOC PV_NOW PV_NEED
+  PE_START="$(pvs --noheadings --units b --nosuffix -o pe_start "${CRYPT_DEV}" 2>/dev/null | tr -d ' ')"
+  EXT_SIZE="$(vgs --noheadings --units b --nosuffix -o vg_extent_size "${IMG_VG_NAME}" 2>/dev/null | tr -d ' ')"
+  ALLOC="$(pvs --noheadings -o pv_pe_alloc_count "${CRYPT_DEV}" 2>/dev/null | tr -d ' ')"
+  PV_NOW="$(pvs --noheadings --units b --nosuffix -o pv_size "${CRYPT_DEV}" 2>/dev/null | tr -d ' ')"
+  if [[ "${PE_START}" =~ ^[0-9]+$ && "${EXT_SIZE}" =~ ^[0-9]+$ \
+     && "${ALLOC}" =~ ^[0-9]+$ && "${PV_NOW}" =~ ^[0-9]+$ ]]; then
+    PV_NEED=$(( PE_START + (ALLOC * EXT_SIZE) ))
+    # Never request more than the device actually holds: pvresize would stop
+    # and ask "Proceed? [y/n]", which is what used to hang the backup.
+    if [ "${PV_NEED}" -lt "${PV_NOW}" ]; then
+      _run_step "pvresize" pvresize -y --setphysicalvolumesize "${PV_NEED}B" "${CRYPT_DEV}" \
+        || PV_NEED="${PV_NOW}"
+    else
+      echo "    PV already holds no spare extents — left unchanged."
+      PV_NEED="${PV_NOW}"
+    fi
+  else
+    echo "    WARNING: could not read PV geometry; leaving the PV unchanged."
+    PV_NEED=$(( CRYPT_SECTORS * 512 ))
+  fi
 
-  echo "  Phase 5: Deactivate and close LUKS..."
+  echo "  Phase 4: Resize LUKS mapping..."
+  local NEW_CRYPT_SECTORS=$(( (PV_NEED + 511) / 512 ))
+  if [ "${NEW_CRYPT_SECTORS}" -lt "${CRYPT_SECTORS}" ]; then
+    _run_step "cryptsetup resize" cryptsetup resize --size "${NEW_CRYPT_SECTORS}" \
+      "${IMG_LUKS_MAPPER}" || NEW_CRYPT_SECTORS="${CRYPT_SECTORS}"
+  else
+    echo "    LUKS mapping already minimal — left unchanged."
+    NEW_CRYPT_SECTORS="${CRYPT_SECTORS}"
+  fi
+
+  echo "  Phase 5: Close LUKS container..."
   _deactivate_image_lvm
   cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
   IMG_MAPPER_OPEN=FALSE
 
-  echo "  Phase 6: Truncate image file and fix GPT..."
+  echo "  Phase 6: Truncate image and rebuild GPT..."
+  local NEW_PART_SECTORS=$(( HEADER_SECTORS + NEW_CRYPT_SECTORS ))
+  if [ "${NEW_PART_SECTORS}" -ge "${PART_SECTORS}" ]; then
+    echo "    Image is already at its minimum size — nothing to truncate."
+    rmloop
+    return 0
+  fi
+
   local START
   START="$(part_start "${IMGFILE}" "${ROOT_PART_NUM}")"
   if ! [[ "${START}" =~ ^[0-9]+$ ]] || [ "${START}" -lt 2048 ]; then
+    rmloop
     errexit "Could not read partition ${ROOT_PART_NUM} start sector from ${IMGFILE}.\nAborting before truncate to avoid corrupting the image."
   fi
-  local NEWEND=$(( START + NEW_LUKS_SECTORS + 33 ))
-  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+  rmloop    # detach before changing the backing file's size
+  truncate -s $(( (START + NEW_PART_SECTORS + 33) * 512 )) "${IMGFILE}"
   _rebuild_gpt "${START}" "8309" "Linux LUKS"
-  rmloop
 }
 
 _shrink_luks_direct()
@@ -1112,33 +1207,57 @@ _shrink_luks_direct()
   mkloop
   _open_image_luks
   local CDEV="/dev/mapper/${IMG_LUKS_MAPPER}"
+  local PART_DEV="${LOOP}p${ROOT_PART_NUM}"
 
-  e2fsck -f -n "${CDEV}" || { cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "before"; }
-  resize2fs -f -M "${CDEV}"
-  resize2fs -f -M "${CDEV}"
-  resize2fs -f -M "${CDEV}"
-  e2fsck -f -n "${CDEV}" || { cryptsetup close "${IMG_LUKS_MAPPER}" &>/dev/null; rmloop; fsckerr "after"; }
+  e2fsck -f -n "${CDEV}" || { _abort_luks_shrink; fsckerr "before"; }
+  echo ""
+  resize2fs -f -M "${CDEV}" </dev/null
+  resize2fs -f -M "${CDEV}" </dev/null
+  resize2fs -f -M "${CDEV}" </dev/null
+  e2fsck -f -n "${CDEV}" || { _abort_luks_shrink; fsckerr "after"; }
 
   local INFO NEWSIZE BLKSIZE
   INFO="$(tune2fs -l "${CDEV}" 2>/dev/null)"
   NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
   BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
-  local NEW_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
-  local NEW_SECTORS=$(( NEW_BYTES / 512 ))
+  if ! [[ "${NEWSIZE}" =~ ^[0-9]+$ && "${BLKSIZE}" =~ ^[0-9]+$ ]]; then
+    _abort_luks_shrink
+    errexit "Could not read filesystem geometry from ${CDEV}."
+  fi
 
-  cryptsetup resize --size "${NEW_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+  local CRYPT_SECTORS PART_SECTORS HEADER_SECTORS NEW_SECTORS
+  CRYPT_SECTORS="$(blockdev --getsz "${CDEV}" 2>/dev/null)"
+  PART_SECTORS="$(blockdev --getsz "${PART_DEV}" 2>/dev/null)"
+  HEADER_SECTORS=$(( PART_SECTORS - CRYPT_SECTORS ))
+  NEW_SECTORS=$(( ((NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) + 511) / 512 ))
+
+  if [ "${NEW_SECTORS}" -lt "${CRYPT_SECTORS}" ]; then
+    _run_step "cryptsetup resize" cryptsetup resize --size "${NEW_SECTORS}" \
+      "${IMG_LUKS_MAPPER}" || NEW_SECTORS="${CRYPT_SECTORS}"
+  else
+    echo "    Filesystem is already at its minimum size — LUKS mapping unchanged."
+    NEW_SECTORS="${CRYPT_SECTORS}"
+  fi
+
   cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
   IMG_MAPPER_OPEN=FALSE
+
+  local NEW_PART_SECTORS=$(( HEADER_SECTORS + NEW_SECTORS ))
+  if [ "${NEW_PART_SECTORS}" -ge "${PART_SECTORS}" ]; then
+    echo "    Image is already at its minimum size — nothing to truncate."
+    rmloop
+    return 0
+  fi
 
   local START
   START="$(part_start "${IMGFILE}" "${ROOT_PART_NUM}")"
   if ! [[ "${START}" =~ ^[0-9]+$ ]] || [ "${START}" -lt 2048 ]; then
+    rmloop
     errexit "Could not read partition ${ROOT_PART_NUM} start sector from ${IMGFILE}.\nAborting before truncate to avoid corrupting the image."
   fi
-  local NEWEND=$(( START + NEW_SECTORS + 33 ))
-  truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
-  _rebuild_gpt "${START}" "8309" "Linux LUKS"
   rmloop
+  truncate -s $(( (START + NEW_PART_SECTORS + 33) * 512 )) "${IMGFILE}"
+  _rebuild_gpt "${START}" "8309" "Linux LUKS"
 }
 
 # Relocate GPT backup header and fix the root partition entry
