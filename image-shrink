@@ -268,17 +268,48 @@ else
     BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
     NEW_LV_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
 
+    CRYPT_SECTORS="$(blockdev --getsz "/dev/mapper/${IMG_LUKS_MAPPER}")"
+    PART_SECTORS="$(blockdev --getsz "${LOOP}p${ROOT_PART_NUM}")"
+    HEADER_SECTORS=$(( PART_SECTORS - CRYPT_SECTORS ))
+    LV_SECTORS="$(blockdev --getsz "${LV_DEV}")"
+
     echo "Phase 2: Reduce LV..."
-    lvreduce --force -L "${NEW_LV_BYTES}B" "${IMG_VG_NAME}/${IMG_LV_NAME}" &> /dev/null
+    if [ $(( NEW_LV_BYTES / 512 )) -lt "${LV_SECTORS}" ]; then
+      lvreduce -y -f -L "${NEW_LV_BYTES}B" "${IMG_VG_NAME}/${IMG_LV_NAME}" </dev/null
+    else
+      echo "  Filesystem already at minimum size — LV unchanged."
+    fi
 
     echo "Phase 3: Resize LVM PV..."
-    NEW_PV_BYTES=$(( NEW_LV_BYTES + (32 * ONEMB) ))
-    pvresize --setphysicalvolumesize "${NEW_PV_BYTES}B" \
-      "/dev/mapper/${IMG_LUKS_MAPPER}" &> /dev/null
+    # Asking for more than the device holds makes pvresize prompt on stdin,
+    # which hangs forever when its output is redirected.
+    PE_START="$(pvs --noheadings --units b --nosuffix -o pe_start "/dev/mapper/${IMG_LUKS_MAPPER}" 2>/dev/null | tr -d ' ')"
+    EXT_SIZE="$(vgs --noheadings --units b --nosuffix -o vg_extent_size "${IMG_VG_NAME}" 2>/dev/null | tr -d ' ')"
+    ALLOC="$(pvs --noheadings -o pv_pe_alloc_count "/dev/mapper/${IMG_LUKS_MAPPER}" 2>/dev/null | tr -d ' ')"
+    PV_NOW="$(pvs --noheadings --units b --nosuffix -o pv_size "/dev/mapper/${IMG_LUKS_MAPPER}" 2>/dev/null | tr -d ' ')"
+    if [[ "${PE_START}" =~ ^[0-9]+$ && "${EXT_SIZE}" =~ ^[0-9]+$ && "${ALLOC}" =~ ^[0-9]+$ && "${PV_NOW}" =~ ^[0-9]+$ ]]; then
+      NEW_PV_BYTES=$(( PE_START + (ALLOC * EXT_SIZE) ))
+      if [ "${NEW_PV_BYTES}" -lt "${PV_NOW}" ]; then
+        pvresize -y --setphysicalvolumesize "${NEW_PV_BYTES}B" \
+          "/dev/mapper/${IMG_LUKS_MAPPER}" </dev/null
+      else
+        echo "  PV already minimal — unchanged."
+        NEW_PV_BYTES="${PV_NOW}"
+      fi
+    else
+      echo "  WARNING: could not read PV geometry; leaving PV unchanged."
+      NEW_PV_BYTES=$(( CRYPT_SECTORS * 512 ))
+    fi
 
     echo "Phase 4: Resize LUKS data area..."
-    NEW_LUKS_SECTORS=$(( (NEW_PV_BYTES + (4 * ONEMB)) / 512 ))
-    cryptsetup resize --size "${NEW_LUKS_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+    NEW_LUKS_SECTORS=$(( (NEW_PV_BYTES + 511) / 512 ))
+    if [ "${NEW_LUKS_SECTORS}" -lt "${CRYPT_SECTORS}" ]; then
+      cryptsetup resize --size "${NEW_LUKS_SECTORS}" "${IMG_LUKS_MAPPER}" </dev/null \
+        || NEW_LUKS_SECTORS="${CRYPT_SECTORS}"
+    else
+      echo "  LUKS mapping already minimal — unchanged."
+      NEW_LUKS_SECTORS="${CRYPT_SECTORS}"
+    fi
 
     echo "Phase 5: Close LUKS..."
     _deactivate_lvm
@@ -286,9 +317,15 @@ else
     IMG_MAPPER_OPEN=FALSE
 
     echo "Phase 6: Truncate image and fix GPT..."
-    NEWEND=$(( ROOT_START + NEW_LUKS_SECTORS + 33 ))
-    truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
-    _rebuild_gpt "${ROOT_START}" "8309" "Linux LUKS"
+    NEW_PART_SECTORS=$(( HEADER_SECTORS + NEW_LUKS_SECTORS ))
+    if [ "${NEW_PART_SECTORS}" -ge "${PART_SECTORS}" ]; then
+      echo "  Image already at minimum size — nothing to truncate."
+    else
+      rmloop
+      NEWEND=$(( ROOT_START + NEW_PART_SECTORS + 33 ))
+      truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+      _rebuild_gpt "${ROOT_START}" "8309" "Linux LUKS"
+    fi
 
   else
     # LUKS direct (no LVM)
@@ -304,15 +341,31 @@ else
     NEWSIZE="$(sed -n 's|^Block count:\s*\(.*\)|\1|p' <<< "${INFO}")"
     BLKSIZE="$(sed -n 's|^Block size:\s*\(.*\)|\1|p' <<< "${INFO}")"
     NEW_BYTES=$(( (NEWSIZE * BLKSIZE) + (ADDMB * ONEMB) ))
-    NEW_SECTORS=$(( NEW_BYTES / 512 ))
+    NEW_SECTORS=$(( (NEW_BYTES + 511) / 512 ))
 
-    cryptsetup resize --size "${NEW_SECTORS}" "${IMG_LUKS_MAPPER}" &> /dev/null
+    CRYPT_SECTORS="$(blockdev --getsz "${CDEV}")"
+    PART_SECTORS="$(blockdev --getsz "${LOOP}p${ROOT_PART_NUM}")"
+    HEADER_SECTORS=$(( PART_SECTORS - CRYPT_SECTORS ))
+
+    if [ "${NEW_SECTORS}" -lt "${CRYPT_SECTORS}" ]; then
+      cryptsetup resize --size "${NEW_SECTORS}" "${IMG_LUKS_MAPPER}" </dev/null \
+        || NEW_SECTORS="${CRYPT_SECTORS}"
+    else
+      echo "  Filesystem already at minimum size — LUKS mapping unchanged."
+      NEW_SECTORS="${CRYPT_SECTORS}"
+    fi
     cryptsetup close "${IMG_LUKS_MAPPER}" &> /dev/null
     IMG_MAPPER_OPEN=FALSE
 
-    NEWEND=$(( ROOT_START + NEW_SECTORS + 33 ))
-    truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
-    _rebuild_gpt "${ROOT_START}" "8309" "Linux LUKS"
+    NEW_PART_SECTORS=$(( HEADER_SECTORS + NEW_SECTORS ))
+    if [ "${NEW_PART_SECTORS}" -ge "${PART_SECTORS}" ]; then
+      echo "  Image already at minimum size — nothing to truncate."
+    else
+      rmloop
+      NEWEND=$(( ROOT_START + NEW_PART_SECTORS + 33 ))
+      truncate -s $(( (NEWEND + 1) * 512 )) "${IMGFILE}"
+      _rebuild_gpt "${ROOT_START}" "8309" "Linux LUKS"
+    fi
   fi
 
   rmloop
